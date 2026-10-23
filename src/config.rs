@@ -9,39 +9,21 @@ use crate::logging;
 use crate::platform;
 use crate::theme::{Theme, ThemeFile};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModePreference {
-    Ask,
-    Ide,
-    Explorer,
-}
-
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub theme: Theme,
     pub bindings: Bindings,
     pub run: BTreeMap<String, String>,
-    pub default_mode: ModePreference,
+    pub workdir: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct Config {
-    pub default_mode: String,
+    pub workdir: String,
     pub theme: ThemeConfig,
     pub shortcuts: ShortcutConfig,
     pub run: BTreeMap<String, String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            default_mode: "ask".to_string(),
-            theme: ThemeConfig::default(),
-            shortcuts: ShortcutConfig::default(),
-            run: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -140,11 +122,15 @@ pub struct ShortcutConfig {
     pub undo: String,
     pub redo: String,
     pub quit: String,
+    pub quit_alt: String,
     pub new_file: String,
     pub new_folder: String,
     pub new_folder_alt: String,
-    pub toggle_mode: String,
+    pub delete: String,
     pub focus_tree: String,
+    pub focus_output: String,
+    pub workdir: String,
+    pub wrap_toggle: String,
     pub refresh: String,
     pub accept_ghost: String,
 }
@@ -161,12 +147,16 @@ impl Default for ShortcutConfig {
             paste: "ctrl+v".to_string(),
             undo: "ctrl+z".to_string(),
             redo: "ctrl+y".to_string(),
-            quit: "ctrl+q".to_string(),
-            new_file: "ctrl+n".to_string(),
+            quit: "ctrl+shift+q".to_string(),
+            quit_alt: "f10, alt+q".to_string(),
+            new_file: "f6, ctrl+n".to_string(),
             new_folder: "f7".to_string(),
-            new_folder_alt: "ctrl+shift+n".to_string(),
-            toggle_mode: "f2".to_string(),
+            new_folder_alt: "alt+n".to_string(),
+            delete: "d, delete".to_string(),
             focus_tree: "ctrl+b".to_string(),
+            focus_output: "ctrl+o".to_string(),
+            workdir: "ctrl+w".to_string(),
+            wrap_toggle: "alt+w".to_string(),
             refresh: "f5".to_string(),
             accept_ghost: "tab".to_string(),
         }
@@ -187,8 +177,11 @@ pub enum Action {
     Quit,
     NewFile,
     NewFolder,
-    ToggleMode,
+    Delete,
     FocusTree,
+    FocusOutput,
+    Workdir,
+    WrapToggle,
     Refresh,
     AcceptGhost,
 }
@@ -219,7 +212,7 @@ impl KeyBinding {
                     label.push_str("M-");
                 }
                 if self.modifiers.contains(KeyModifiers::SHIFT) {
-                    label.push_str("S-");
+                    label.push_str("^⇧");
                 }
                 label.push(c.to_ascii_uppercase());
                 label
@@ -247,7 +240,7 @@ impl KeyBinding {
 
 #[derive(Debug, Clone)]
 pub struct Bindings {
-    entries: Vec<(Action, KeyBinding)>,
+    entries: Vec<(Action, Vec<KeyBinding>)>,
 }
 
 impl Bindings {
@@ -256,91 +249,117 @@ impl Bindings {
         let entries = vec![
             (
                 Action::Save,
-                parse_binding(&config.save, &defaults.save, "save"),
+                parse_bindings(&config.save, &defaults.save, "save"),
             ),
             (
                 Action::Run,
-                parse_binding(&config.run, &defaults.run, "run"),
+                parse_bindings(&config.run, &defaults.run, "run"),
             ),
             (
                 Action::Find,
-                parse_binding(&config.find, &defaults.find, "find"),
+                parse_bindings(&config.find, &defaults.find, "find"),
             ),
             (
                 Action::FindNext,
-                parse_binding(&config.find_next, &defaults.find_next, "find_next"),
+                parse_bindings(&config.find_next, &defaults.find_next, "find_next"),
             ),
             (
                 Action::Goto,
-                parse_binding(&config.goto, &defaults.goto, "goto"),
+                parse_bindings(&config.goto, &defaults.goto, "goto"),
             ),
             (
                 Action::Copy,
-                parse_binding(&config.copy, &defaults.copy, "copy"),
+                parse_bindings(&config.copy, &defaults.copy, "copy"),
             ),
             (
                 Action::Paste,
-                parse_binding(&config.paste, &defaults.paste, "paste"),
+                parse_bindings(&config.paste, &defaults.paste, "paste"),
             ),
             (
                 Action::Undo,
-                parse_binding(&config.undo, &defaults.undo, "undo"),
+                parse_bindings(&config.undo, &defaults.undo, "undo"),
             ),
             (
                 Action::Redo,
-                parse_binding(&config.redo, &defaults.redo, "redo"),
+                parse_bindings(&config.redo, &defaults.redo, "redo"),
             ),
             (
                 Action::Quit,
-                parse_binding(&config.quit, &defaults.quit, "quit"),
-            ),
-            (
-                Action::NewFile,
-                parse_binding(&config.new_file, &defaults.new_file, "new_file"),
-            ),
-            (
-                Action::NewFolder,
-                parse_binding(&config.new_folder, &defaults.new_folder, "new_folder"),
-            ),
-            (
-                Action::NewFolder,
-                parse_binding(
-                    &config.new_folder_alt,
-                    &defaults.new_folder_alt,
-                    "new_folder_alt",
+                merge_bindings(
+                    parse_bindings(&config.quit, &defaults.quit, "quit"),
+                    parse_bindings(&config.quit_alt, &defaults.quit_alt, "quit_alt"),
                 ),
             ),
             (
-                Action::ToggleMode,
-                parse_binding(&config.toggle_mode, &defaults.toggle_mode, "toggle_mode"),
+                Action::NewFile,
+                parse_bindings(&config.new_file, &defaults.new_file, "new_file"),
+            ),
+            (
+                Action::NewFolder,
+                merge_bindings(
+                    parse_bindings(&config.new_folder, &defaults.new_folder, "new_folder"),
+                    parse_bindings(
+                        &config.new_folder_alt,
+                        &defaults.new_folder_alt,
+                        "new_folder_alt",
+                    ),
+                ),
+            ),
+            (
+                Action::Delete,
+                parse_bindings(&config.delete, &defaults.delete, "delete"),
             ),
             (
                 Action::FocusTree,
-                parse_binding(&config.focus_tree, &defaults.focus_tree, "focus_tree"),
+                parse_bindings(&config.focus_tree, &defaults.focus_tree, "focus_tree"),
+            ),
+            (
+                Action::FocusOutput,
+                parse_bindings(
+                    &config.focus_output,
+                    &defaults.focus_output,
+                    "focus_output",
+                ),
+            ),
+            (
+                Action::Workdir,
+                parse_bindings(&config.workdir, &defaults.workdir, "workdir"),
+            ),
+            (
+                Action::WrapToggle,
+                parse_bindings(
+                    &config.wrap_toggle,
+                    &defaults.wrap_toggle,
+                    "wrap_toggle",
+                ),
             ),
             (
                 Action::Refresh,
-                parse_binding(&config.refresh, &defaults.refresh, "refresh"),
+                parse_bindings(&config.refresh, &defaults.refresh, "refresh"),
             ),
             (
                 Action::AcceptGhost,
-                parse_binding(&config.accept_ghost, &defaults.accept_ghost, "accept_ghost"),
+                parse_bindings(
+                    &config.accept_ghost,
+                    &defaults.accept_ghost,
+                    "accept_ghost",
+                ),
             ),
         ];
         Self { entries }
     }
 
     pub fn matches(&self, action: Action, event: &KeyEvent) -> bool {
-        self.entries
-            .iter()
-            .any(|(candidate, binding)| *candidate == action && binding.matches(event))
+        self.entries.iter().any(|(candidate, bindings)| {
+            *candidate == action && bindings.iter().any(|binding| binding.matches(event))
+        })
     }
 
     pub fn binding(&self, action: Action) -> Option<KeyBinding> {
         self.entries
             .iter()
             .find(|(candidate, _)| *candidate == action)
-            .map(|(_, binding)| *binding)
+            .and_then(|(_, bindings)| bindings.first().copied())
     }
 
     pub fn label(&self, action: Action) -> String {
@@ -350,16 +369,30 @@ impl Bindings {
     }
 }
 
-pub fn parse_binding(value: &str, fallback: &str, name: &str) -> KeyBinding {
-    parse_binding_value(value).unwrap_or_else(|| {
+fn merge_bindings(left: Vec<KeyBinding>, right: Vec<KeyBinding>) -> Vec<KeyBinding> {
+    let mut merged = left;
+    merged.extend(right);
+    merged
+}
+
+fn parse_bindings(value: &str, fallback: &str, name: &str) -> Vec<KeyBinding> {
+    let mut result = Vec::new();
+    for part in value.split(',') {
+        if let Some(binding) = parse_binding_value(part.trim()) {
+            result.push(binding);
+        }
+    }
+    if result.is_empty() {
         logging::warn(&format!(
             "некорректный шорткат {name}='{value}', используется '{fallback}'"
         ));
-        parse_binding_value(fallback).unwrap_or(KeyBinding {
-            code: KeyCode::Null,
-            modifiers: KeyModifiers::NONE,
-        })
-    })
+        for part in fallback.split(',') {
+            if let Some(binding) = parse_binding_value(part.trim()) {
+                result.push(binding);
+            }
+        }
+    }
+    result
 }
 
 fn parse_binding_value(value: &str) -> Option<KeyBinding> {
@@ -453,22 +486,50 @@ pub fn load() -> LoadedConfig {
     let theme_file = ThemeFile::from(&config.theme);
     let theme = Theme::from_file(&theme_file);
     let bindings = Bindings::from_config(&config.shortcuts);
-    let default_mode = match config.default_mode.to_ascii_lowercase().as_str() {
-        "ide" => ModePreference::Ide,
-        "explorer" | "exp" => ModePreference::Explorer,
-        "ask" => ModePreference::Ask,
-        other => {
-            logging::warn(&format!(
-                "неизвестный default_mode='{other}', используется ask"
-            ));
-            ModePreference::Ask
-        }
-    };
+    let workdir = resolve_workdir(&config.workdir);
     LoadedConfig {
         theme,
         bindings,
         run: config.run,
-        default_mode,
+        workdir,
+    }
+}
+
+fn resolve_workdir(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = if trimmed == "~" {
+        platform::home_dir()
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        platform::home_dir().join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| {
+            logging::warn(&format!("workdir '{}' недоступен: {error}", path.display()));
+            error
+        })
+        .ok()?;
+    if canonical.is_dir() {
+        Some(canonical)
+    } else {
+        logging::warn(&format!("workdir '{}' не каталог", canonical.display()));
+        None
+    }
+}
+
+#[cfg(test)]
+impl LoadedConfig {
+    pub fn test_stub() -> Self {
+        Self {
+            theme: Theme::fallback(),
+            bindings: Bindings::from_config(&ShortcutConfig::default()),
+            run: BTreeMap::new(),
+            workdir: None,
+        }
     }
 }
 
@@ -508,5 +569,39 @@ fn load_config(path: &PathBuf) -> Config {
             ));
             Config::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_bindings_parse() {
+        let bindings = Bindings::from_config(&ShortcutConfig::default());
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(bindings.matches(Action::Quit, &key));
+        let f10 = KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE);
+        assert!(bindings.matches(Action::Quit, &f10));
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(!bindings.matches(Action::Quit, &ctrl_q));
+    }
+
+    #[test]
+    fn parse_multiple_bindings() {
+        let bindings = parse_bindings("ctrl+shift+q,f10", "ctrl+shift+q", "quit");
+        assert_eq!(bindings.len(), 2);
+    }
+
+    #[test]
+    fn alt_bindings_parse() {
+        let bindings = parse_bindings("alt+n", "f7", "new_folder_alt");
+        let alt_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT);
+        let wrapped = Bindings {
+            entries: vec![(Action::NewFolder, bindings)],
+        };
+        assert!(wrapped.matches(Action::NewFolder, &alt_n));
+        let tree_match = wrapped.matches(Action::Quit, &alt_n);
+        assert!(!tree_match);
     }
 }

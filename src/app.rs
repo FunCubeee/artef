@@ -6,53 +6,24 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::{Action, Bindings, LoadedConfig, ModePreference};
+use crate::config::{Action, Bindings, LoadedConfig};
 use crate::editor::Editor;
 use crate::file_tree::FileTree;
 use crate::highlight::Highlighter;
-use crate::language::Language;
 use crate::logging;
-use crate::platform;
 use crate::runner::{self, RunExit, RunPlan, Runner};
 use crate::theme::Theme;
+use crate::platform;
 
 pub const EXTENSIONS: [&str; 13] = [
     "py", "js", "ts", "rs", "go", "c", "cpp", "sh", "json", "yaml", "md", "toml", "txt",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Explorer,
-    Ide,
-}
-
-impl Mode {
-    pub fn tag(self) -> &'static str {
-        match self {
-            Mode::Explorer => "EXP",
-            Mode::Ide => "IDE",
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Mode::Explorer => "Explorer",
-            Mode::Ide => "IDE",
-        }
-    }
-
-    fn other(self) -> Mode {
-        match self {
-            Mode::Explorer => Mode::Ide,
-            Mode::Ide => Mode::Explorer,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Tree,
     Editor,
+    Output,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,12 +36,6 @@ pub enum InputMode {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Modal {
     None,
-    ModeSelect {
-        selected: usize,
-        path_input: String,
-        editing_path: bool,
-        error: Option<String>,
-    },
     NewFileName {
         folder: PathBuf,
         input: String,
@@ -88,10 +53,20 @@ pub enum Modal {
         selected: usize,
         error: Option<String>,
     },
-    GuiConfirm {
-        plan: RunPlan,
-        reason: String,
+    RuntimeSelect {
+        target: PathBuf,
+        selected: usize,
+        error: Option<String>,
     },
+    DeleteConfirm {
+        path: PathBuf,
+        is_dir: bool,
+    },
+    SaveConfirm {
+        then_quit: bool,
+        pending_focus_tree: bool,
+    },
+    QuitConfirm,
 }
 
 #[derive(Debug, Clone)]
@@ -102,9 +77,9 @@ pub struct Notice {
 }
 
 pub struct App {
-    pub mode: Mode,
     pub focus: Focus,
     pub tree: FileTree,
+    pub workdir: PathBuf,
     pub editor: Editor,
     pub highlighter: Highlighter,
     pub runner: Runner,
@@ -121,20 +96,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        settings: LoadedConfig,
-        root: PathBuf,
-        cli_mode: Option<Mode>,
-        initial_file: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(settings: LoadedConfig, root: PathBuf, initial_file: Option<PathBuf>) -> Self {
         let mut file_tree = FileTree::new(root);
-        let default_mode = match settings.default_mode {
-            ModePreference::Ide => Some(Mode::Ide),
-            ModePreference::Explorer => Some(Mode::Explorer),
-            ModePreference::Ask => None,
-        };
-        let show_chooser = cli_mode.is_none() && default_mode.is_none();
-        let mode = cli_mode.or(default_mode).unwrap_or(Mode::Explorer);
         let mut editor = Editor::default();
         let mut notice = None;
         if let Some(file) = initial_file.as_ref() {
@@ -153,25 +116,19 @@ impl App {
                 }
             }
         }
-        let focus = if mode == Mode::Ide && editor.has_file() {
+        let focus = if editor.has_file() {
             Focus::Editor
         } else {
             Focus::Tree
         };
-        let modal = if show_chooser {
-            Modal::ModeSelect {
-                selected: if mode == Mode::Ide { 1 } else { 0 },
-                path_input: file_tree.root.display().to_string(),
-                editing_path: false,
-                error: None,
-            }
-        } else {
-            Modal::None
-        };
-        let mut app = Self {
-            mode,
+        let workdir = settings
+            .workdir
+            .filter(|path| path.starts_with(&file_tree.root))
+            .unwrap_or_else(|| file_tree.root.clone());
+        Self {
             focus,
             tree: file_tree,
+            workdir,
             editor,
             highlighter: Highlighter::default(),
             runner: Runner::new(),
@@ -181,15 +138,11 @@ impl App {
             input_mode: InputMode::Normal,
             prompt: String::new(),
             last_search: String::new(),
-            modal,
+            modal: Modal::None,
             notice,
             clipboard: String::new(),
             should_quit: false,
-        };
-        if app.modal != Modal::None {
-            app.focus = Focus::Tree;
         }
-        app
     }
 
     pub fn sync_highlights(&mut self) {
@@ -207,6 +160,9 @@ impl App {
                 self.notice = None;
             }
         }
+        if !self.runner.is_running() && self.focus == Focus::Output {
+            self.focus = Focus::Editor;
+        }
     }
 
     pub fn active_notice(&self) -> Option<&Notice> {
@@ -215,16 +171,56 @@ impl App {
             .filter(|notice| Instant::now() < notice.until)
     }
 
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.modal != Modal::None {
+            return;
+        }
+        if self.input_mode != InputMode::Normal {
+            for ch in text.chars() {
+                if !ch.is_control() {
+                    self.prompt.push(ch);
+                }
+            }
+            return;
+        }
+        match self.focus {
+            Focus::Editor => {
+                if self.editor.has_file() {
+                    self.editor.paste(text);
+                }
+            }
+            Focus::Output => {
+                let proxied = crate::editor::sanitize_text(text).replace('\n', "\r");
+                if !proxied.is_empty() {
+                    self.runner.send_input(proxied.as_bytes());
+                }
+            }
+            Focus::Tree => {}
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return;
         }
         if self.bindings.matches(Action::Quit, &key) {
-            self.request_quit();
+            if self.focus == Focus::Editor {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.return_to_tree();
+                } else {
+                    self.begin_quit();
+                }
+            } else {
+                self.begin_quit();
+            }
             return;
         }
         if self.modal != Modal::None {
             self.handle_modal_key(key);
+            return;
+        }
+        if self.focus == Focus::Output {
+            self.handle_output_key(key);
             return;
         }
         if key.code == KeyCode::PageUp {
@@ -239,8 +235,8 @@ impl App {
             self.handle_prompt_key(key);
             return;
         }
-        if self.bindings.matches(Action::ToggleMode, &key) {
-            self.toggle_mode();
+        if self.bindings.matches(Action::FocusOutput, &key) {
+            self.toggle_output_focus();
             return;
         }
         if self.bindings.matches(Action::FocusTree, &key) {
@@ -296,6 +292,14 @@ impl App {
             self.begin_new_folder();
             return;
         }
+        if self.focus == Focus::Tree && self.bindings.matches(Action::Delete, &key) {
+            self.begin_delete_selected();
+            return;
+        }
+        if self.bindings.matches(Action::Workdir, &key) {
+            self.make_workdir();
+            return;
+        }
         if self.bindings.matches(Action::Refresh, &key) {
             self.tree.refresh();
             self.set_notice("Дерево обновлено", false);
@@ -305,7 +309,79 @@ impl App {
         match self.focus {
             Focus::Tree => self.handle_tree_key(key),
             Focus::Editor => self.handle_editor_key(key),
+            Focus::Output => {}
         }
+    }
+
+    fn handle_output_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            if self.bindings.matches(Action::FocusOutput, &key) {
+                self.toggle_output_focus();
+                return;
+            }
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.runner.send_input(&[0x03]);
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    self.runner.send_input(&[0x04]);
+                    return;
+                }
+                // crossterm maps 0x1c to Char('4') + CONTROL
+                KeyCode::Char('4') | KeyCode::Char('\\') => {
+                    self.runner.send_input(&[0x1c]);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let sequence: Option<Vec<u8>> = match key.code {
+            KeyCode::Enter => Some(vec![b'\r']),
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Some(ch.to_string().into_bytes())
+            }
+            KeyCode::Backspace => Some(vec![0x7f]),
+            KeyCode::Tab => Some(vec![b'\t']),
+            KeyCode::Esc => Some(vec![0x1b]),
+            KeyCode::Up => Some(b"\x1b[A".to_vec()),
+            KeyCode::Down => Some(b"\x1b[B".to_vec()),
+            KeyCode::Right => Some(b"\x1b[C".to_vec()),
+            KeyCode::Left => Some(b"\x1b[D".to_vec()),
+            KeyCode::Home => Some(b"\x1b[H".to_vec()),
+            KeyCode::End => Some(b"\x1b[F".to_vec()),
+            KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+            KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+            KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+            KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+            _ => None,
+        };
+        if let Some(bytes) = sequence {
+            self.runner.send_input(&bytes);
+        }
+    }
+
+    fn toggle_output_focus(&mut self) {
+        if self.runner.is_running() {
+            self.focus = if self.focus == Focus::Output {
+                Focus::Editor
+            } else {
+                Focus::Output
+            };
+        } else {
+            self.focus = if self.focus == Focus::Output {
+                Focus::Editor
+            } else {
+                Focus::Tree
+            };
+        }
+        self.input_mode = InputMode::Normal;
+        self.prompt.clear();
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
@@ -330,7 +406,15 @@ impl App {
             }
             KeyCode::Enter => self.activate_tree_selection(),
             KeyCode::Left => self.tree.collapse_or_parent(),
-            KeyCode::Tab => self.focus = Focus::Editor,
+            KeyCode::Char('q') if key.modifiers.is_empty() => self.begin_quit_confirm(),
+            KeyCode::Char('w') if key.modifiers.is_empty() => self.make_workdir(),
+            KeyCode::Tab => {
+                if self.runner.is_running() {
+                    self.toggle_output_focus();
+                } else {
+                    self.focus = Focus::Editor;
+                }
+            }
             _ => {}
         }
     }
@@ -341,6 +425,19 @@ impl App {
             if self.editor.has_file() && !self.editor.accept_ghost() {
                 self.editor.insert_tab();
             }
+            return;
+        }
+        if self.bindings.matches(Action::WrapToggle, &key) {
+            self.editor.toggle_wrap();
+            let state = if self.editor.wrap { "вкл" } else { "выкл" };
+            self.set_notice(format!("Перенос строк: {state}"), false);
+            return;
+        }
+        if key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+            && self.runner.is_running()
+        {
+            self.toggle_output_focus();
             return;
         }
         match key.code {
@@ -368,9 +465,14 @@ impl App {
             KeyCode::Esc => {
                 if self.editor.ghost().is_some() {
                     self.editor.dismiss_ghost();
-                } else {
+                } else if self.editor.selection().is_some() {
                     self.editor.anchor = None;
+                } else {
+                    self.return_to_tree();
                 }
+            }
+            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.return_to_tree();
             }
             KeyCode::BackTab => self.focus = Focus::Tree,
             KeyCode::Char(ch)
@@ -382,6 +484,19 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn return_to_tree(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.prompt.clear();
+        if self.editor.has_file() && self.editor.modified {
+            self.modal = Modal::SaveConfirm {
+                then_quit: false,
+                pending_focus_tree: true,
+            };
+            return;
+        }
+        self.focus = Focus::Tree;
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
@@ -540,10 +655,19 @@ impl App {
         }
     }
 
-    fn request_quit(&mut self) {
-        if self.save_if_needed() {
-            self.should_quit = true;
+    fn begin_quit(&mut self) {
+        if self.editor.has_file() && self.editor.modified {
+            self.modal = Modal::SaveConfirm {
+                then_quit: true,
+                pending_focus_tree: false,
+            };
+            return;
         }
+        self.begin_quit_confirm();
+    }
+
+    fn begin_quit_confirm(&mut self) {
+        self.modal = Modal::QuitConfirm;
     }
 
     fn open_file(&mut self, path: &Path) {
@@ -584,24 +708,21 @@ impl App {
         }
     }
 
-    fn toggle_mode(&mut self) {
-        self.mode = self.mode.other();
-        self.focus = match self.mode {
-            Mode::Explorer => Focus::Tree,
-            Mode::Ide => {
-                if self.editor.has_file() {
-                    Focus::Editor
-                } else {
-                    Focus::Tree
-                }
-            }
-        };
-        self.input_mode = InputMode::Normal;
-        self.prompt.clear();
-        self.set_notice(format!("Режим {}", self.mode.name()), false);
+    fn make_workdir(&mut self) {
+        let workdir = self.tree.current_directory();
+        self.workdir = workdir.clone();
+        self.set_notice(
+            format!("Рабочая директория: {}", self.tree.relative_display(&workdir)),
+            false,
+        );
     }
 
     fn run_selected(&mut self) {
+        if self.runner.is_running() {
+            self.set_notice("Выполнение уже идёт: Tab — фокус ввода/вывода", false);
+            self.focus = Focus::Output;
+            return;
+        }
         let target = match self.focus {
             Focus::Editor => self.editor.path.clone().or_else(|| {
                 self.tree
@@ -617,6 +738,7 @@ impl App {
                 }
                 _ => None,
             },
+            Focus::Output => None,
         };
         let Some(target) = target else {
             self.set_notice("Нет файла для запуска", true);
@@ -626,10 +748,32 @@ impl App {
             self.set_notice(format!("{} не является файлом", target.display()), true);
             return;
         }
-        if self.editor.path.as_deref() == Some(target.as_path()) && !self.save_if_needed() {
+        if !self.save_if_needed() {
             return;
         }
-        let plan = match runner::build_plan(&target, &self.run_rules, &self.tree.root) {
+        let extension = target
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if extension.is_empty() {
+            if let Some(command) = runner::shebang_command(&target) {
+                let plan = RunPlan {
+                    file: target.clone(),
+                    cwd: self.workdir.clone(),
+                    command,
+                };
+                self.start_embedded(plan);
+                return;
+            }
+            self.modal = Modal::RuntimeSelect {
+                target,
+                selected: 0,
+                error: None,
+            };
+            return;
+        }
+        let plan = match runner::build_plan(&target, &self.run_rules, &self.workdir) {
             Ok(plan) => plan,
             Err(error) => {
                 logging::error(&error);
@@ -638,38 +782,28 @@ impl App {
                 return;
             }
         };
-        let language = Language::from_path(&target);
-        let content = if self.editor.path.as_deref() == Some(target.as_path()) {
-            self.editor.display_text()
-        } else {
-            fs::read_to_string(&target).unwrap_or_default()
-        };
-        if let Some(warning) = runner::gui_warning(&target, language, &content) {
-            self.modal = Modal::GuiConfirm {
-                plan,
-                reason: warning.reason,
-            };
-            return;
-        }
         self.start_embedded(plan);
     }
 
     fn start_embedded(&mut self, plan: RunPlan) {
-        if let Err(error) = self.runner.start(&plan) {
-            logging::error(&error);
-            self.runner.output.add_error(error.clone());
-            self.set_notice(error, true);
-            return;
+        match self.runner.start(&plan) {
+            Ok(()) => {
+                self.set_notice(
+                    format!("Запущено {}. Tab — фокус на вывод", plan.file.display()),
+                    false,
+                );
+                self.focus = Focus::Output;
+            }
+            Err(error) => {
+                logging::error(&error);
+                self.runner.output.add_error(error.clone());
+                self.set_notice(error, true);
+            }
         }
-        self.set_notice("Программа запущена", false);
     }
 
     fn begin_new_file(&mut self) {
-        if self.mode != Mode::Ide {
-            self.set_notice("Создание файлов доступно в режиме IDE (F2)", true);
-            return;
-        }
-        let folder = self.tree.current_directory();
+        let folder = self.workdir.clone();
         self.modal = Modal::NewFileName {
             folder,
             input: String::new(),
@@ -678,11 +812,7 @@ impl App {
     }
 
     fn begin_new_folder(&mut self) {
-        if self.mode != Mode::Ide {
-            self.set_notice("Создание папок доступно в режиме IDE (F2)", true);
-            return;
-        }
-        let parent = self.tree.current_directory();
+        let parent = self.workdir.clone();
         self.modal = Modal::NewFolderName {
             parent,
             input: String::new(),
@@ -690,107 +820,79 @@ impl App {
         };
     }
 
+    fn begin_delete_selected(&mut self) {
+        let Some(entry) = self.tree.selected_entry() else {
+            return;
+        };
+        if entry.is_dir && entry.path == self.workdir {
+            self.set_notice("Нельзя удалить рабочую директорию", true);
+            return;
+        }
+        self.modal = Modal::DeleteConfirm {
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+        };
+    }
+
+    fn perform_delete(&mut self, path: &Path, is_dir: bool) {
+        let result = if is_dir {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        self.modal = Modal::None;
+        match result {
+            Ok(()) => {
+                let name = self.tree.relative_display(path);
+                let editor_inside = self
+                    .editor
+                    .path
+                    .as_ref()
+                    .is_some_and(|current| current == path || current.starts_with(path));
+                if editor_inside {
+                    self.editor = Editor::default();
+                }
+                self.tree.refresh();
+                self.set_notice(format!("Удалено: {name}"), false);
+            }
+            Err(error) => {
+                let message = format!("Не удалось удалить: {error}");
+                logging::error(&message);
+                self.set_notice(message, true);
+            }
+        }
+    }
+
     fn handle_modal_key(&mut self, key: KeyEvent) {
         let modal = std::mem::replace(&mut self.modal, Modal::None);
         match modal {
             Modal::None => {}
-            Modal::ModeSelect {
-                mut selected,
-                mut path_input,
-                mut editing_path,
-                mut error,
-            } => {
-                let mut finished = false;
-                if editing_path {
-                    match key.code {
-                        KeyCode::Esc => {
-                            editing_path = false;
-                            path_input = self.tree.root.display().to_string();
-                            error = None;
-                        }
-                        KeyCode::Enter => match validate_directory(&path_input) {
-                            Ok(path) => {
-                                path_input = path.display().to_string();
-                                editing_path = false;
-                                error = None;
-                            }
-                            Err(message) => error = Some(message),
-                        },
-                        KeyCode::Backspace => {
-                            path_input.pop();
-                            error = None;
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            path_input.clear();
-                            error = None;
-                        }
-                        KeyCode::Char(ch)
-                            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                                && !key.modifiers.contains(KeyModifiers::ALT) =>
-                        {
-                            path_input.push(ch);
-                            error = None;
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.should_quit = true;
-                            return;
-                        }
-                        KeyCode::Up | KeyCode::Left => {
-                            selected = selected.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Right => {
-                            selected = (selected + 1).min(1);
-                        }
-                        KeyCode::Tab => {
-                            editing_path = true;
-                            error = None;
-                        }
-                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            editing_path = true;
-                            error = None;
-                        }
-                        KeyCode::Enter => {
-                            match self.apply_project_and_mode(&path_input, selected) {
-                                Ok(()) => {
-                                    finished = true;
-                                }
-                                Err(message) => error = Some(message),
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if !finished && !self.should_quit {
-                    self.modal = Modal::ModeSelect {
-                        selected,
-                        path_input,
-                        editing_path,
-                        error,
-                    };
-                }
-            }
             Modal::NewFileName {
                 folder,
                 mut input,
                 mut error,
             } => {
                 match key.code {
-                    KeyCode::Esc => {}
+                    KeyCode::Esc => return,
                     KeyCode::Enter => match validate_new_name(&input) {
                         Ok(()) => {
-                            let (base, extension_index) = split_known_extension(input.trim());
+                            let trimmed = input.trim().to_string();
+                            let has_extension = trimmed
+                                .rsplit_once('.')
+                                .is_some_and(|(base, extension)| !base.is_empty() && !extension.is_empty());
+                            if has_extension {
+                                self.create_file(&folder, &trimmed);
+                                return;
+                            }
+                            let base = trimmed.trim_end_matches('.').to_string();
                             if base.is_empty() {
                                 error = Some("Имя файла не может быть пустым".to_string());
                             } else {
                                 self.modal = Modal::ExtensionSelect {
                                     folder,
                                     base,
-                                    original_name: input.trim().to_string(),
-                                    selected: extension_index,
+                                    original_name: trimmed,
+                                    selected: 0,
                                     error: None,
                                 };
                                 return;
@@ -823,7 +925,7 @@ impl App {
                 mut error,
             } => {
                 match key.code {
-                    KeyCode::Esc => {}
+                    KeyCode::Esc => return,
                     KeyCode::Enter => match validate_new_name(&input) {
                         Ok(()) => match fs::create_dir(parent.join(input.trim())) {
                             Ok(()) => {
@@ -862,30 +964,25 @@ impl App {
                 base,
                 original_name,
                 mut selected,
-                mut error,
+                error,
             } => {
                 match key.code {
-                    KeyCode::Esc => {
-                        self.modal = Modal::NewFileName {
-                            folder,
-                            input: original_name,
-                            error: None,
-                        };
-                        return;
-                    }
+                    KeyCode::Esc => return,
                     KeyCode::Up | KeyCode::Left => {
                         selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Right => {
-                        selected = (selected + 1).min(EXTENSIONS.len() - 1);
+                        selected = (selected + 1).min(EXTENSIONS.len());
                     }
                     KeyCode::Enter => {
-                        if let Err(message) = self.create_file(&folder, &base, EXTENSIONS[selected])
-                        {
-                            error = Some(message);
-                        } else {
+                        if selected == 0 {
+                            let name = base.clone();
+                            self.create_file(&folder, &name);
                             return;
                         }
+                        let name = format!("{}.{}", base, EXTENSIONS[selected - 1]);
+                        self.create_file(&folder, &name);
+                        return;
                     }
                     _ => {}
                 }
@@ -897,96 +994,155 @@ impl App {
                     error,
                 };
             }
-            Modal::GuiConfirm { plan, reason } => match key.code {
+            Modal::RuntimeSelect {
+                target,
+                mut selected,
+                mut error,
+            } => {
+                match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Up | KeyCode::Left => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Right => {
+                        selected = (selected + 1).min(RUNTIME_HINTS.len() - 1);
+                    }
+                    KeyCode::Enter => {
+                        let (extension, hint) = RUNTIME_HINTS[selected];
+                        if let Some(required) = hint {
+                            if platform::find_program(required).is_none() {
+                                error = Some(format!(
+                                    "не установлено: {required} (pkg install {required})"
+                                ));
+                                self.modal = Modal::RuntimeSelect {
+                                    target,
+                                    selected,
+                                    error,
+                                };
+                                return;
+                            }
+                        }
+                        match runner::plan_for_extension(
+                            &target,
+                            extension,
+                            &self.run_rules,
+                            &self.workdir,
+                        ) {
+                            Ok(plan) => {
+                                self.start_embedded(plan);
+                                return;
+                            }
+                            Err(message) => error = Some(message),
+                        }
+                    }
+                    _ => {}
+                }
+                self.modal = Modal::RuntimeSelect {
+                    target,
+                    selected,
+                    error,
+                };
+            }
+            Modal::DeleteConfirm { path, is_dir } => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.launch_external(plan);
+                    self.perform_delete(&path, is_dir);
                 }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    let _ = reason;
-                    self.runner.output.add_system("Запуск отменён.");
+                KeyCode::Char('n')
+                | KeyCode::Char('N')
+                | KeyCode::Char('q')
+                | KeyCode::Esc => {}
+                _ => {}
+            },
+            Modal::SaveConfirm {
+                then_quit,
+                pending_focus_tree,
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let _ = pending_focus_tree;
+                    match self.editor.save() {
+                        Ok(()) => {
+                            if then_quit {
+                                self.should_quit = true;
+                            } else {
+                                self.focus = Focus::Tree;
+                            }
+                        }
+                        Err(error) => {
+                            logging::error(&error);
+                            self.set_notice(error, true);
+                            self.focus = Focus::Editor;
+                        }
+                    }
                 }
-                _ => {
-                    self.modal = Modal::GuiConfirm { plan, reason };
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.editor.modified = false;
+                    if then_quit {
+                        self.should_quit = true;
+                    } else {
+                        self.focus = Focus::Tree;
+                    }
                 }
+                _ => {}
+            },
+            Modal::QuitConfirm => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.should_quit = true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
+                _ => {}
             },
         }
     }
 
-    fn apply_project_and_mode(&mut self, path_input: &str, selected: usize) -> Result<(), String> {
-        let path = validate_directory(path_input)?;
-        let changed = path != self.tree.root;
-        if changed {
-            self.runner.shutdown();
-            self.runner.output.clear();
-            self.tree.set_root(path.clone());
-            self.editor = Editor::default();
-            self.highlighter = Highlighter::default();
-            self.clipboard.clear();
-            self.runner.output.clear();
-            self.runner.exit = None;
-        }
-        self.mode = if selected == 1 {
-            Mode::Ide
-        } else {
-            Mode::Explorer
-        };
-        self.modal = Modal::None;
-        self.focus = if self.mode == Mode::Ide && self.editor.has_file() {
-            Focus::Editor
-        } else {
-            Focus::Tree
-        };
-        if changed {
-            self.set_notice(format!("Открыт проект {}", path.display()), false);
-        } else {
-            self.set_notice(format!("Режим {}", self.mode.name()), false);
-        }
-        Ok(())
-    }
-
-    fn create_file(&mut self, folder: &Path, base: &str, extension: &str) -> Result<(), String> {
-        if !self.save_if_needed() {
-            return Err("Сначала сохраните текущий файл".to_string());
-        }
-        let file_name = format!("{base}.{extension}");
-        let path = folder.join(&file_name);
-        let mut file = OpenOptions::new()
+    fn create_file(&mut self, folder: &Path, file_name: &str) {
+        let path = folder.join(file_name);
+        let mut file = match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
-            .map_err(|error| format!("Не удалось создать {file_name}: {error}"))?;
-        file.flush()
-            .map_err(|error| format!("Не удалось записать {file_name}: {error}"))?;
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let message = format!("Не удалось создать {file_name}: {error}");
+                self.modal = Modal::NewFileName {
+                    folder: folder.to_path_buf(),
+                    input: file_name.to_string(),
+                    error: Some(message.clone()),
+                };
+                self.set_notice(message, true);
+                return;
+            }
+        };
+        if let Err(error) = file.flush() {
+            self.set_notice(
+                format!("Не удалось записать {file_name}: {error}"),
+                true,
+            );
+        }
         drop(file);
-        let opened = Editor::open(&path, 4)
-            .map_err(|error| format!("Файл создан, но не открыт: {error}"))?;
-        self.editor = opened;
-        self.highlighter = Highlighter::default();
-        self.tree.refresh_reveal(&path);
-        self.modal = Modal::None;
-        self.focus = Focus::Editor;
-        self.set_notice(
-            format!("Создан {file_name}; язык: {}", self.editor.language.title()),
-            false,
-        );
-        Ok(())
-    }
-
-    fn launch_external(&mut self, plan: RunPlan) {
-        match platform::launch_external(&plan.command, &plan.cwd) {
-            Ok(terminal) => {
-                self.runner.output.clear();
-                self.runner.output.add_system(format!("$ {}", plan.command));
-                self.runner
-                    .output
-                    .add_system(format!("Запущено во внешнем терминале: {terminal}"));
-                self.runner.exit = None;
-                self.set_notice("Программа запущена во внешнем терминале", false);
+        if !self.save_if_needed() {
+            return;
+        }
+        self.editor = Editor::default();
+        match Editor::open(&path, 4) {
+            Ok(opened) => {
+                let language = opened.language.title();
+                self.editor = opened;
+                self.highlighter = Highlighter::default();
+                self.tree.refresh_reveal(&path);
+                self.modal = Modal::None;
+                self.focus = Focus::Editor;
+                self.set_notice(
+                    format!("Создан {file_name}; язык: {language}"),
+                    false,
+                );
             }
             Err(error) => {
                 logging::error(&error);
-                self.runner.output.add_error(error.clone());
-                self.set_notice(error, true);
+                self.tree.refresh_reveal(&path);
+                self.modal = Modal::None;
+                self.focus = Focus::Tree;
+                self.set_notice(format!("Файл создан, но не открыт: {error}"), true);
             }
         }
     }
@@ -1008,47 +1164,23 @@ impl App {
         self.runner.exit
     }
 
-    pub fn status_path(&self) -> String {
-        if let Some(path) = &self.editor.path {
-            self.tree.relative_display(path)
-        } else {
-            self.tree.relative_display(&self.tree.root)
-        }
-    }
-
     pub fn search_query(&self) -> Option<&str> {
         self.editor.search.as_deref()
     }
 }
 
-pub fn validate_directory(input: &str) -> Result<PathBuf, String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err("Путь к проекту пуст".to_string());
-    }
-    let expanded = if trimmed == "~" {
-        platform::home_dir()
-    } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        platform::home_dir().join(rest)
-    } else {
-        let path = PathBuf::from(trimmed);
-        if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map_err(|error| format!("Не удалось определить текущий каталог: {error}"))?
-                .join(path)
-        }
-    };
-    let canonical =
-        fs::canonicalize(&expanded).map_err(|error| format!("Каталог недоступен: {error}"))?;
-    if !canonical.is_dir() {
-        return Err(format!("{} не является каталогом", canonical.display()));
-    }
-    Ok(canonical)
-}
+const RUNTIME_HINTS: [(&str, Option<&str>); 8] = [
+    ("py", Some("python3")),
+    ("js", Some("node")),
+    ("ts", Some("tsx")),
+    ("sh", Some("bash")),
+    ("go", Some("go")),
+    ("c", Some("gcc")),
+    ("cpp", Some("g++")),
+    ("rs", Some("cargo")),
+];
 
-fn validate_new_name(input: &str) -> Result<(), String> {
+pub fn validate_new_name(input: &str) -> Result<(), String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("Имя не может быть пустым".to_string());
@@ -1059,22 +1191,139 @@ fn validate_new_name(input: &str) -> Result<(), String> {
     if trimmed.contains('/') || trimmed.contains('\\') {
         return Err("Имя не должно содержать разделители пути".to_string());
     }
-    if trimmed
-        .chars()
-        .any(|ch| ch == '\0' || "<>:\"|?*".contains(ch))
-    {
+    if trimmed.chars().any(|ch| ch == '\0') {
         return Err("Имя содержит недопустимые символы".to_string());
     }
     Ok(())
 }
 
-fn split_known_extension(input: &str) -> (String, usize) {
-    let lower = input.to_ascii_lowercase();
-    for (index, extension) in EXTENSIONS.iter().enumerate() {
-        let suffix = format!(".{extension}");
-        if lower.ends_with(&suffix) && input.len() > suffix.len() {
-            return (input[..input.len() - suffix.len()].to_string(), index);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workdir_starts_at_root() {
+        let settings = LoadedConfig::test_stub();
+        let root = std::env::temp_dir().join(format!("artef-app-{}", std::process::id()));
+        fs::create_dir_all(&root).ok();
+        let app = App::new(settings, root.clone(), None);
+        assert_eq!(app.workdir, root);
+        fs::remove_dir_all(&root).ok();
     }
-    (input.to_string(), 0)
+
+    #[test]
+    fn output_focus_only_while_running() {
+        let mut app = App::new(LoadedConfig::test_stub(), std::env::temp_dir(), None);
+        app.focus = Focus::Output;
+        app.tick();
+        assert_ne!(app.focus, Focus::Output);
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("artef-{}-{}", name, std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn delete_file_flow() {
+        let root = temp_root("del");
+        let file = root.join("f.txt");
+        fs::write(&file, b"hi").unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        let index = app
+            .tree
+            .entries
+            .iter()
+            .position(|e| !e.is_dir)
+            .expect("file in tree");
+        app.tree.selected = index;
+        app.begin_delete_selected();
+        assert!(matches!(app.modal, Modal::DeleteConfirm { .. }));
+        app.handle_modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.modal, Modal::None);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn delete_folder_flow() {
+        let root = temp_root("deldir");
+        let sub = root.join("sub");
+        fs::create_dir_all(sub.join("nested")).unwrap();
+        fs::write(sub.join("nested").join("x.txt"), b"x").unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        let index = app
+            .tree
+            .entries
+            .iter()
+            .filter_map(|e| if e.is_dir && e.path != root { Some(0) } else { None })
+            .next()
+            .map(|_| {
+                app.tree
+                    .entries
+                    .iter()
+                    .position(|e| e.is_dir && e.path != root)
+                    .unwrap()
+            })
+            .unwrap();
+        app.tree.selected = index;
+        app.begin_delete_selected();
+        assert!(matches!(app.modal, Modal::DeleteConfirm { is_dir: true, .. }));
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.modal, Modal::None);
+        assert!(!sub.exists());
+    }
+
+    #[test]
+    fn delete_cancel_esc_keeps_file() {
+        let root = temp_root("delcancel");
+        let file = root.join("keep.txt");
+        fs::write(&file, b"hi").unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        let index = app
+            .tree
+            .entries
+            .iter()
+            .position(|e| !e.is_dir)
+            .expect("file in tree");
+        app.tree.selected = index;
+        app.begin_delete_selected();
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.modal, Modal::None);
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn delete_refuses_workdir() {
+        let root = temp_root("delroot");
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        if let Some(index) = app
+            .tree
+            .entries
+            .iter()
+            .position(|e| e.is_dir && e.path == root)
+        {
+            app.tree.selected = index;
+        }
+        app.begin_delete_selected();
+        assert_eq!(app.modal, Modal::None);
+    }
+
+    #[test]
+    fn new_file_esc_closes_modal() {
+        let root = temp_root("newfiiles");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        let index = app
+            .tree
+            .entries
+            .iter()
+            .position(|e| e.is_dir)
+            .expect("dir in tree");
+        app.tree.selected = index;
+        app.begin_new_file();
+        assert!(matches!(app.modal, Modal::NewFileName { .. }));
+        app.handle_modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.modal, Modal::None);
+    }
 }

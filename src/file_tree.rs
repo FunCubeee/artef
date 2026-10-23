@@ -52,15 +52,6 @@ impl FileTree {
         tree
     }
 
-    pub fn set_root(&mut self, root: PathBuf) {
-        self.root = fs::canonicalize(&root).unwrap_or(root);
-        self.expanded.clear();
-        self.entries.clear();
-        self.selected = 0;
-        self.scroll = 0;
-        self.rebuild();
-    }
-
     pub fn selected_entry(&self) -> Option<&TreeEntry> {
         self.entries.get(self.selected)
     }

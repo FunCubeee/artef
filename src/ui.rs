@@ -5,8 +5,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Focus, InputMode, Modal, Mode, EXTENSIONS};
+use crate::app::{App, EXTENSIONS, Focus, InputMode, Modal};
 use crate::config::Action;
+use crate::editor::wrap_ranges;
 use crate::highlight::SyntaxKind;
 use crate::platform;
 use crate::runner::{OutLine, OutSource, OutStyle};
@@ -103,19 +104,23 @@ fn draw_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .split(area);
         match app.focus {
             Focus::Tree => draw_tree(frame, app, panels[0], unicode),
-            Focus::Editor => draw_editor(frame, app, panels[0], unicode),
+            _ => draw_editor(frame, app, panels[0], unicode),
         }
         draw_output(frame, app, panels[1]);
     } else {
         match app.focus {
             Focus::Tree => draw_tree(frame, app, area, unicode),
-            Focus::Editor => draw_editor(frame, app, area, unicode),
+            _ => draw_editor(frame, app, area, unicode),
         }
     }
 }
 
-fn panel_block(theme: Theme, title: Line<'static>, active: bool) -> Block<'static> {
-    let border = if active { theme.accent } else { theme.border };
+fn panel_block(theme: Theme, title: Line<'static>, active: bool, focused_output: bool) -> Block<'static> {
+    let border = if focused_output || active {
+        theme.accent
+    } else {
+        theme.border
+    };
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -136,9 +141,13 @@ fn draw_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) {
         .unwrap_or_else(|| app.tree.root.display().to_string());
     let title = Line::from(vec![
         Span::styled(" FILES ", Style::default().fg(theme.folder)),
+        Span::styled(
+            format!("· {} (workdir) ", app.tree.relative_display(&app.workdir)),
+            Style::default().fg(theme.muted),
+        ),
         Span::styled(format!("· {project} "), Style::default().fg(theme.muted)),
     ]);
-    let block = panel_block(theme, title, active);
+    let block = panel_block(theme, title, active, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -300,6 +309,7 @@ fn draw_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) 
         } else {
             String::new()
         };
+        let wrap_mode = if app.editor.wrap { "wrap" } else { "lines" };
         Line::from(vec![
             Span::styled(format!(" {name}"), Style::default().fg(theme.file)),
             Span::styled(marker, Style::default().fg(theme.error)),
@@ -307,11 +317,15 @@ fn draw_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) 
                 format!("[{}] ", app.editor.language.title()),
                 Style::default().fg(theme.key),
             ),
+            Span::styled(
+                format!("[{wrap_mode}] · L{}:{} ", app.editor.cursor_row_number(), app.editor.column_number()),
+                Style::default().fg(theme.line_number),
+            ),
         ])
     } else {
         Line::from(Span::styled(" EDITOR ", Style::default().fg(theme.muted)))
     };
-    let block = panel_block(theme, title, focused);
+    let block = panel_block(theme, title, focused, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -327,51 +341,80 @@ fn draw_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) 
     let digits = app.editor.line_count().max(1).to_string().len();
     let gutter_width = if width > digits + 5 { digits + 2 } else { 0 };
     let code_width = width.saturating_sub(gutter_width);
-    if app.editor.cursor_line < app.editor.scroll {
-        app.editor.scroll = app.editor.cursor_line;
-    } else if app.editor.cursor_line >= app.editor.scroll + height {
-        app.editor.scroll = app.editor.cursor_line + 1 - height;
-    }
+
+    let wrapped = app.editor.wrap && code_width > 0;
     let cursor_active = app.focus == Focus::Editor
         && app.modal == Modal::None
         && app.input_mode == InputMode::Normal;
-    let cursor_x = app
-        .editor
-        .lines
+
+    let starts_snapshot: Vec<usize> = if wrapped {
+        app.editor.visual_starts(code_width).to_vec()
+    } else {
+        let total = app.editor.line_count();
+        (0..=total).collect()
+    };
+    let cursor_within = if wrapped {
+        app.editor.cursor_row_offset()
+    } else {
+        0
+    };
+    let cursor_visual = starts_snapshot
         .get(app.editor.cursor_line)
-        .map(|line| display_prefix_width(line, app.editor.cursor_col, app.editor.tab_width))
-        .unwrap_or(0);
-    if code_width > 0 {
-        if cursor_x < app.editor.x_scroll {
-            app.editor.x_scroll = cursor_x;
-        } else if cursor_x >= app.editor.x_scroll + code_width {
-            app.editor.x_scroll = cursor_x + 1 - code_width;
+        .copied()
+        .unwrap_or(0)
+        + cursor_within;
+    if cursor_visual < app.editor.scroll {
+        app.editor.scroll = cursor_visual;
+    } else if cursor_visual >= app.editor.scroll + height {
+        app.editor.scroll = cursor_visual + 1 - height;
+    }
+    if !wrapped {
+        let cursor_x = app
+            .editor
+            .lines
+            .get(app.editor.cursor_line)
+            .map(|line| display_prefix_width(line, app.editor.cursor_col, app.editor.tab_width))
+            .unwrap_or(0);
+        if code_width > 0 {
+            if cursor_x < app.editor.x_scroll {
+                app.editor.x_scroll = cursor_x;
+            } else if cursor_x >= app.editor.x_scroll + code_width {
+                app.editor.x_scroll = cursor_x + 1 - code_width;
+            }
         }
     }
-    let start = app.editor.scroll;
-    let mut lines = Vec::with_capacity(height);
-    for row in 0..height {
-        let index = start + row;
-        if index < app.editor.lines.len() {
-            lines.push(build_editor_line(
-                app,
-                index,
-                code_width,
-                gutter_width,
-                digits,
-                cursor_active,
-            ));
-        } else if gutter_width > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("{:>digits$} ~", "", digits = gutter_width.saturating_sub(1)),
-                Style::default().fg(theme.muted).bg(theme.panel),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "~",
-                Style::default().fg(theme.muted).bg(theme.panel),
-            )));
+
+    let total_rows = *starts_snapshot.last().unwrap_or(&0);
+    let scroll = app.editor.scroll.min(total_rows.saturating_sub(1));
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    for row_index in 0..height {
+        let visual = scroll + row_index;
+        if visual >= total_rows {
+            if gutter_width > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("{:>digits$} ~", "", digits = cursor_number_width(gutter_width)),
+                    Style::default().fg(theme.muted).bg(theme.panel),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "~",
+                    Style::default().fg(theme.muted).bg(theme.panel),
+                )));
+            }
+            continue;
         }
+        let line_index = partition_line(&starts_snapshot, visual);
+        let row_in_line = visual - starts_snapshot[line_index];
+        lines.push(build_editor_row(
+            app,
+            line_index,
+            row_in_line,
+            gutter_width,
+            digits,
+            code_width,
+            wrapped,
+            cursor_active,
+        ));
     }
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.panel)),
@@ -379,12 +422,24 @@ fn draw_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) 
     );
 }
 
+fn cursor_number_width(gutter_width: usize) -> usize {
+    gutter_width.saturating_sub(1)
+}
+
+fn partition_line(starts: &[usize], visual: usize) -> usize {
+    let limit = starts.len().saturating_sub(2);
+    let mut position = starts.len().saturating_sub(1);
+    for (index, value) in starts.iter().take(limit + 1).enumerate() {
+        if *value > visual {
+            position = index.saturating_sub(1);
+            break;
+        }
+    }
+    position.min(limit)
+}
+
 fn draw_welcome(frame: &mut Frame<'_>, app: &App, inner: Rect) {
     let theme = app.theme;
-    let mode = match app.mode {
-        Mode::Explorer => "Explorer",
-        Mode::Ide => "IDE",
-    };
     let lines = vec![
         Line::from(Span::styled(
             "artef",
@@ -402,7 +457,7 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, inner: Rect) {
             Style::default().fg(theme.file),
         )),
         Line::from(Span::styled(
-            format!("Режим: {mode}"),
+            format!("Рабочая директория: {}", app.workdir.display()),
             Style::default().fg(theme.key),
         )),
         Line::from(""),
@@ -411,11 +466,11 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, inner: Rect) {
             Style::default().fg(theme.file),
         )),
         Line::from(Span::styled(
-            "Ctrl+N новый файл · Ctrl+F поиск · F2 сменить режим",
+            "Ctrl+N файл · Alt+N папка · D удалить · Ctrl+W рабочая папка",
             Style::default().fg(theme.muted),
         )),
         Line::from(Span::styled(
-            "Ctrl+S сохранить · Ctrl+R запустить · Ctrl+Q выход",
+            "Ctrl+S сохранить · Ctrl+R запустить · Ctrl+Shift+Q выход",
             Style::default().fg(theme.muted),
         )),
     ];
@@ -437,12 +492,15 @@ struct DisplayCell {
     width: usize,
 }
 
-fn build_editor_line(
+#[allow(clippy::too_many_arguments)]
+fn build_editor_row(
     app: &App,
     line_index: usize,
-    code_width: usize,
+    row_in_line: usize,
     gutter_width: usize,
     digits: usize,
+    code_width: usize,
+    wrapped: bool,
     cursor_active: bool,
 ) -> Line<'static> {
     let theme = app.theme;
@@ -452,33 +510,38 @@ fn build_editor_line(
         .get(line_index)
         .map(String::as_str)
         .unwrap_or("");
-    let chars: Vec<char> = text.chars().collect();
     let tab_width = editor.tab_width.max(1);
-    let mut cells: Vec<DisplayCell> = Vec::with_capacity(chars.len());
+    let ranges = wrap_ranges(text, if wrapped { code_width } else { usize::MAX }, tab_width);
+    let Some(&(row_start, row_end)) = ranges.get(row_in_line) else {
+        return Line::from(Span::styled(
+            " ".repeat(code_width + gutter_width),
+            Style::default().bg(theme.panel),
+        ));
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut cells: Vec<DisplayCell> = Vec::new();
     let mut x = 0usize;
     for (index, ch) in chars.iter().copied().enumerate() {
+        if index < row_start {
+            if ch == '\t' {
+                x += tab_width - (x % tab_width);
+            } else {
+                x += UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+            }
+            continue;
+        }
+        if index >= row_end {
+            break;
+        }
         if ch == '\t' {
             let spaces = tab_width - (x % tab_width);
-            for _ in 0..spaces {
-                cells.push(DisplayCell {
-                    text: " ".to_string(),
-                    original: index,
-                    x,
-                    width: 1,
-                });
-                x += 1;
-            }
+            spaces_to_cells(&mut cells, index, spaces, &mut x);
             continue;
         }
         let mut width = UnicodeWidthChar::width(ch).unwrap_or(0);
         if ch.is_control() {
             width = 1;
-        }
-        if width == 0 {
-            if let Some(last) = cells.last_mut() {
-                last.text.push(ch);
-            }
-            continue;
         }
         cells.push(DisplayCell {
             text: if ch.is_control() {
@@ -492,13 +555,17 @@ fn build_editor_line(
         });
         x += width;
     }
-    let total_width = x;
+
     let cursor_col = editor.cursor_col.min(chars.len());
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(code_width.min(160) + 2);
     let mut code_used = 0usize;
-    if gutter_width > 0 {
+    let show_gutter = gutter_width > 0 && (!wrapped || row_in_line == 0);
+    if show_gutter {
         let number_style = if line_index == editor.cursor_line {
-            Style::default().fg(theme.accent).bg(theme.panel)
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.panel)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.line_number).bg(theme.panel)
         };
@@ -511,6 +578,11 @@ fn build_editor_line(
                 Style::default().bg(theme.panel),
             ));
         }
+    } else if gutter_width > 0 {
+        spans.push(Span::styled(
+            " ".repeat(gutter_width),
+            Style::default().bg(theme.panel),
+        ));
     }
 
     let selection = editor.selection();
@@ -525,13 +597,16 @@ fn build_editor_line(
             }
         }
     }
-    let ghost = if cursor_active && line_index == editor.cursor_line {
+    let ghost = if cursor_active
+        && line_index == editor.cursor_line
+        && (!wrapped || row_end == chars.len())
+    {
         editor.ghost().map(|suggestion| {
             suggestion
                 .completion
                 .chars()
                 .map(|ch| {
-                    if ch == '\n' || ch == '\r' || ch == '\t' {
+                    if ch == '\n' || ch == '\r' || ch == '\t' || ch.is_control() {
                         ' '
                     } else {
                         ch
@@ -542,15 +617,18 @@ fn build_editor_line(
     } else {
         None
     };
-    let cursor_original = if ghost.is_some() {
-        cursor_col.checked_sub(1)
-    } else if cursor_col < chars.len() {
-        Some(cursor_col)
-    } else {
+    let cursor_on_row = !wrapped
+        || (editor.cursor_col >= row_start && editor.cursor_col <= row_end);
+    let cursor_original = if !cursor_on_row {
         None
+    } else if ghost.is_some() && cursor_col > 0 {
+        cursor_col.checked_sub(1)
+    } else {
+        Some(cursor_col).filter(|col| !chars.is_empty() || *col == 0)
     };
     let mut ghost_inserted = false;
 
+    let x_scroll = if wrapped { 0 } else { editor.x_scroll };
     for cell in &cells {
         if let Some(ghost_text) = ghost.as_deref() {
             if !ghost_inserted && cell.original >= cursor_col {
@@ -559,17 +637,17 @@ fn build_editor_line(
                     ghost_text,
                     cell.x,
                     code_width,
-                    app.editor.x_scroll,
+                    x_scroll,
                     theme,
                     &mut code_used,
                 );
                 ghost_inserted = true;
             }
         }
-        if cell.x < app.editor.x_scroll {
+        if cell.x < x_scroll {
             continue;
         }
-        if cell.x + cell.width > app.editor.x_scroll + code_width {
+        if cell.x + cell.width > x_scroll + code_width {
             break;
         }
         let mut style = syntax_style(theme, app.highlighter.kind(line_index, cell.original));
@@ -592,7 +670,10 @@ fn build_editor_line(
         if search_flags.get(cell.original).copied().unwrap_or(false) {
             style = style.bg(theme.search).fg(theme.file);
         }
-        if cursor_active && cursor_original == Some(cell.original) {
+        if cursor_active
+            && cursor_on_row
+            && cursor_original == Some(cell.original)
+        {
             style = Style::default()
                 .fg(theme.background)
                 .bg(theme.file)
@@ -607,17 +688,18 @@ fn build_editor_line(
             append_ghost(
                 &mut spans,
                 ghost_text,
-                total_width,
+                x,
                 code_width,
-                app.editor.x_scroll,
+                x_scroll,
                 theme,
                 &mut code_used,
             );
         }
     } else if cursor_active
+        && cursor_on_row
         && cursor_col >= chars.len()
-        && total_width >= app.editor.x_scroll
-        && total_width < app.editor.x_scroll + code_width
+        && x >= x_scroll
+        && x < x_scroll + code_width
         && code_used < code_width
     {
         spans.push(Span::styled(
@@ -630,6 +712,18 @@ fn build_editor_line(
     }
 
     Line::from(spans).style(Style::default().bg(theme.panel))
+}
+
+fn spaces_to_cells(cells: &mut Vec<DisplayCell>, original: usize, spaces: usize, x: &mut usize) {
+    for _ in 0..spaces {
+        cells.push(DisplayCell {
+            text: " ".to_string(),
+            original,
+            x: *x,
+            width: 1,
+        });
+        *x += 1;
+    }
 }
 
 fn append_ghost(
@@ -699,6 +793,7 @@ fn syntax_style(theme: Theme, kind: SyntaxKind) -> Style {
 
 fn draw_output(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let theme = app.theme;
+    let focused_output = app.focus == Focus::Output;
     let (state_text, state_color) = if app.runner.is_running() {
         ("running".to_string(), theme.accent)
     } else if let Some(exit) = app.exit() {
@@ -720,13 +815,18 @@ fn draw_output(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let title = Line::from(vec![
         Span::styled(" OUTPUT ", Style::default().fg(theme.key)),
         Span::styled(format!("· {state_text} "), Style::default().fg(state_color)),
+        Span::styled(
+            "· ввод: клавиатура ".to_string(),
+            Style::default().fg(theme.muted),
+        ),
     ]);
-    let block = panel_block(theme, title, false);
+    let block = panel_block(theme, title, false, focused_output);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    app.runner.set_winsize(inner.width, inner.height);
     let width = inner.width as usize;
     let height = inner.height as usize;
     let mut rows = Vec::new();
@@ -767,7 +867,6 @@ fn wrap_out_line(line: &OutLine, width: usize, theme: Theme) -> Vec<Line<'static
     }
     let base_color = match line.source {
         OutSource::Stdout => theme.output,
-        OutSource::Stderr => theme.error,
         OutSource::System => theme.accent,
         OutSource::Error => theme.error,
     };
@@ -863,11 +962,13 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, two_rows: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let right_width = area.width.min(16);
+    let status_rect = Rect::new(area.x, area.y, area.width, 1);
+    let right_width = area.width.min(20);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(right_width)])
-        .split(Rect::new(area.x, area.y, area.width, 1));
+        .split(status_rect);
+    let workdir = fit_tail(&app.tree.relative_display(&app.workdir), 28);
     let mut left = vec![
         Span::styled(
             " artef ",
@@ -876,22 +977,29 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, two_rows: bool) {
                 .bg(theme.status_bg)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("│ ", Style::default().fg(theme.muted).bg(theme.status_bg)),
         Span::styled(
-            format!("[{}]", app.mode.tag()),
-            Style::default().fg(theme.key).bg(theme.status_bg),
+            workdir,
+            Style::default().fg(theme.status_fg).bg(theme.status_bg),
         ),
-        Span::styled(" │ ", Style::default().fg(theme.muted).bg(theme.status_bg)),
     ];
-    let path_width = columns[0].width.saturating_sub(18) as usize;
-    let path = fit_tail(&app.status_path(), path_width.max(8));
-    left.push(Span::styled(
-        path,
-        Style::default().fg(theme.status_fg).bg(theme.status_bg),
-    ));
     if app.editor.modified {
         left.push(Span::styled(
             format!(" {}", Glyphs::new(use_unicode(area.width)).modified),
             Style::default().fg(theme.error).bg(theme.status_bg),
+        ));
+    }
+    if app.runner.is_running() {
+        left.push(Span::styled(
+            if app.focus == Focus::Output {
+                " │ [OUTPUT FOCUS] "
+            } else {
+                " │ [TUI FOCUS] "
+            },
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.status_bg)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     if !two_rows {
@@ -929,7 +1037,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, two_rows: bool) {
         columns[0],
     );
 
-    let exit = if app.runner.is_running() {
+    let status = if app.runner.is_running() {
         Span::styled(
             " running ",
             Style::default()
@@ -940,7 +1048,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, two_rows: bool) {
     } else if let Some(exit) = app.exit() {
         let label = match exit.code {
             Some(code) => format!(" exit:{code} "),
-            None => " killed ".to_string(),
+            None => " exited ".to_string(),
         };
         Span::styled(
             label,
@@ -956,11 +1064,14 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect, two_rows: bool) {
     } else {
         Span::styled(
             " ready ",
-            Style::default().fg(theme.muted).bg(theme.status_bg),
+            Style::default()
+                .fg(theme.muted)
+                .bg(theme.status_bg)
+                .add_modifier(Modifier::BOLD),
         )
     };
     frame.render_widget(
-        Paragraph::new(Line::from(exit))
+        Paragraph::new(Line::from(vec![status]))
             .alignment(Alignment::Right)
             .style(Style::default().bg(theme.status_bg)),
         columns[1],
@@ -1023,19 +1134,19 @@ fn prompt_spans(app: &App) -> Vec<Span<'static>> {
 }
 
 fn hint_spans(app: &App, theme: Theme) -> Vec<Span<'static>> {
-    let mode_action = if app.mode == Mode::Ide { "Exp" } else { "IDE" };
-    let items = [
-        (Action::Save, "Save"),
-        (Action::Run, "Run"),
-        (Action::NewFile, "New"),
-        (Action::Find, "Find"),
-        (Action::ToggleMode, mode_action),
-        (Action::Quit, "Quit"),
+    let items: Vec<(Action, String)> = vec![
+        (Action::Save, "Save".to_string()),
+        (Action::Run, "Run".to_string()),
+        (Action::NewFile, "New".to_string()),
+        (Action::Workdir, "Workdir".to_string()),
+        (Action::Find, "Find".to_string()),
+        (Action::FocusOutput, "Focus".to_string()),
+        (Action::Quit, "Quit".to_string()),
     ];
     let mut spans = Vec::new();
     for (index, (action, label)) in items.iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled("  ", Style::default().bg(theme.status_bg)));
+            spans.push(Span::styled(" ", Style::default().bg(theme.status_bg)));
         }
         spans.push(Span::styled(
             "[",
@@ -1053,8 +1164,11 @@ fn hint_spans(app: &App, theme: Theme) -> Vec<Span<'static>> {
             Style::default().fg(theme.muted).bg(theme.status_bg),
         ));
         spans.push(Span::styled(
-            (*label).to_string(),
-            Style::default().fg(theme.status_fg).bg(theme.status_bg),
+            label.clone(),
+            Style::default()
+                .fg(theme.status_fg)
+                .bg(theme.status_bg)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     spans
@@ -1088,11 +1202,13 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
     let theme = app.theme;
     let area = frame.area();
     let (width, height, title) = match &app.modal {
-        Modal::ModeSelect { .. } => (78, 14, "artef · старт"),
-        Modal::NewFileName { .. } => (68, 10, "новый файл"),
+        Modal::NewFileName { .. } => (68, 11, "новый файл"),
         Modal::NewFolderName { .. } => (68, 10, "новая папка"),
-        Modal::ExtensionSelect { .. } => (76, 13, "расширение файла"),
-        Modal::GuiConfirm { .. } => (76, 13, "внешний запуск"),
+        Modal::ExtensionSelect { .. } => (76, 13, "язык для файла"),
+        Modal::RuntimeSelect { .. } => (70, 13, "выбор рантайма"),
+        Modal::DeleteConfirm { .. } => (64, 8, "удалить?"),
+        Modal::SaveConfirm { .. } => (64, 8, "сохранить?"),
+        Modal::QuitConfirm => (64, 8, "выход из artef"),
         Modal::None => return,
     };
     let rect = modal_area(area, width, height);
@@ -1120,25 +1236,13 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
     let unicode = use_unicode(inner.width);
     let glyphs = Glyphs::new(unicode);
     let lines = match &app.modal {
-        Modal::ModeSelect {
-            selected,
-            path_input,
-            editing_path,
-            error,
-        } => mode_select_lines(
-            app,
-            *selected,
-            path_input,
-            *editing_path,
-            error.as_deref(),
-            width,
-            &glyphs,
-        ),
         Modal::NewFileName {
             folder,
             input,
             error,
-        } => new_name_lines(app, "Файл", folder, input, error.as_deref(), width),
+        } => {
+            new_name_lines(app, "Файл", folder, input, error.as_deref(), width)
+        }
         Modal::NewFolderName {
             parent,
             input,
@@ -1150,13 +1254,47 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
             error,
             ..
         } => extension_lines(app, base, *selected, error.as_deref(), width),
-        Modal::GuiConfirm { plan, reason } => gui_confirm_lines(app, &plan.command, reason, width),
+        Modal::RuntimeSelect {
+            selected, error, ..
+        } => runtime_lines(app, *selected, error.as_deref(), width),
+        Modal::DeleteConfirm { path, is_dir } => {
+            let raw = app.tree.relative_display(path);
+            let name = fit_tail(&raw, width.saturating_sub(14));
+            let kind = if *is_dir { "папку" } else { "файл" };
+            confirm_lines(
+                app,
+                &format!(" Удалить {kind} «{name}» безвозвратно?"),
+                " Enter/Y удалить · Esc/N отменить",
+                width,
+            )
+        }
+        Modal::SaveConfirm { then_quit, .. } => {
+            let (question, hints) = if *then_quit {
+                (
+                    " Есть несохранённые изменения. Сохранить перед выходом?",
+                    " Enter/Y сохранить и выйти · N/Esc не сохранять и выйти",
+                )
+            } else {
+                (
+                    " Есть несохранённые изменения. Сохранить перед возвратом к дереву?",
+                    " Enter/Y сохранить · N/Esc не сохранять · вернуться к дереву",
+                )
+            };
+            confirm_lines(app, question, hints, width)
+        }
+        Modal::QuitConfirm => confirm_lines(
+            app,
+            " Выйти из artef целиком?",
+            " Enter/Y выйти · N/Esc остаться · Ctrl+C в выводе идёт в процесс",
+            width,
+        ),
         Modal::None => Vec::new(),
     };
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme.panel)),
         inner,
     );
+    let _ = glyphs;
 }
 
 fn modal_area(area: Rect, requested_width: u16, requested_height: u16) -> Rect {
@@ -1168,102 +1306,6 @@ fn modal_area(area: Rect, requested_width: u16, requested_height: u16) -> Rect {
         width,
         height,
     )
-}
-
-fn mode_select_lines(
-    app: &App,
-    selected: usize,
-    path_input: &str,
-    editing_path: bool,
-    error: Option<&str>,
-    width: usize,
-    glyphs: &Glyphs,
-) -> Vec<Line<'static>> {
-    let theme = app.theme;
-    let mut lines = vec![
-        Line::from(Span::styled(
-            " Выберите режим работы",
-            Style::default().fg(theme.file).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    let options = [
-        ("Explorer", "просмотр файлов и запуск"),
-        ("IDE", "редактор, поиск и запуск"),
-    ];
-    for (index, (name, description)) in options.iter().enumerate() {
-        let is_selected = index == selected;
-        let marker = if is_selected { glyphs.closed } else { "  " };
-        let text = format!(" {marker}{name:<10} {description}");
-        let padding = width.saturating_sub(text.width());
-        let style = if is_selected {
-            Style::default()
-                .fg(theme.accent)
-                .bg(theme.active_bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.file).bg(theme.panel)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{text}{}", " ".repeat(padding)),
-            style,
-        )));
-    }
-    lines.push(Line::from(""));
-    let label = if editing_path {
-        " Путь: "
-    } else {
-        " Проект: "
-    };
-    let max_path = width.saturating_sub(label.width() + 1);
-    let shown = fit_tail(path_input, max_path);
-    let cursor = if editing_path {
-        if use_unicode(width as u16) {
-            "▌"
-        } else {
-            "_"
-        }
-    } else {
-        ""
-    };
-    lines.push(Line::from(vec![
-        Span::styled(label, Style::default().fg(theme.key)),
-        Span::styled(shown, Style::default().fg(theme.file)),
-        Span::styled(cursor, Style::default().fg(theme.accent)),
-    ]));
-    lines.push(Line::from(Span::styled(
-        if editing_path {
-            " Enter применить путь · Esc вернуть текущий"
-        } else {
-            " Tab или Ctrl+O изменить путь проекта"
-        },
-        Style::default().fg(theme.muted),
-    )));
-    if let Some(error) = error {
-        lines.push(Line::from(Span::styled(
-            format!(" {error}"),
-            Style::default().fg(theme.error),
-        )));
-    } else {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(Span::styled(
-        format!(
-            " {} / {} выбор · Enter открыть · Esc выход",
-            if use_unicode(width as u16) {
-                "↑↓"
-            } else {
-                "Up/Down"
-            },
-            if use_unicode(width as u16) {
-                "←→"
-            } else {
-                "Left/Right"
-            }
-        ),
-        Style::default().fg(theme.muted),
-    )));
-    lines
 }
 
 fn new_name_lines(
@@ -1310,7 +1352,7 @@ fn new_name_lines(
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
-        " Enter создаёт файл в выбранной папке",
+        " Расширение опционально: есть — язык авто, нет — выбор языка",
         Style::default().fg(theme.muted),
     )));
     lines.push(Line::from(Span::styled(
@@ -1334,11 +1376,12 @@ fn extension_lines(
             Span::styled(base.to_string(), Style::default().fg(theme.file)),
         ]),
         Line::from(Span::styled(
-            " Выберите расширение",
+            " Выберите язык (или создайте без расширения)",
             Style::default().fg(theme.file).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ];
+    let total = EXTENSIONS.len() + 1;
     let columns = if width >= 60 {
         4
     } else if width >= 28 {
@@ -1347,23 +1390,24 @@ fn extension_lines(
         1
     };
     let cell_width = (width / columns).max(1);
-    for chunk_start in (0..EXTENSIONS.len()).step_by(columns) {
+    for chunk_start in (0..total).step_by(columns) {
         let mut spans = Vec::new();
         for offset in 0..columns {
             let index = chunk_start + offset;
-            if index >= EXTENSIONS.len() {
+            if index >= total {
                 spans.push(Span::styled(
                     " ".repeat(cell_width),
                     Style::default().bg(theme.panel),
                 ));
                 continue;
             }
-            let text = format!(
-                " .{:<width$}",
-                EXTENSIONS[index],
-                width = cell_width.saturating_sub(2)
-            );
-            let text = format!("{text:<cell_width$}");
+            let label = if index == 0 {
+                "(без расшир.)".to_string()
+            } else {
+                format!(".{}", EXTENSIONS[index - 1])
+            };
+            let text = format!(" {:<width$}", label, width = cell_width.saturating_sub(2));
+            let text = format!("{:<cw$}", text, cw = cell_width);
             let style = if index == selected {
                 Style::default()
                     .fg(theme.accent)
@@ -1376,13 +1420,20 @@ fn extension_lines(
         }
         lines.push(Line::from(spans));
     }
+    let selected_label = if selected == 0 {
+        "(без расширения)".to_string()
+    } else {
+        format!(".{}", EXTENSIONS[selected - 1])
+    };
+    lines.push(Line::from(Span::styled(
+        format!(" Итоговое имя: {base}{selected_label}"),
+        Style::default().fg(theme.key),
+    )));
     if let Some(error) = error {
         lines.push(Line::from(Span::styled(
             format!(" {error}"),
             Style::default().fg(theme.error),
         )));
-    } else {
-        lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
         format!(
@@ -1403,62 +1454,105 @@ fn extension_lines(
     lines
 }
 
-fn gui_confirm_lines(app: &App, command: &str, reason: &str, width: usize) -> Vec<Line<'static>> {
+fn runtime_lines(
+    app: &App,
+    selected: usize,
+    error: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let theme = app.theme;
-    let mut lines = vec![
-        Line::from(Span::styled(
-            " Программа требует отдельного окна",
+    let mut lines = vec![Line::from(Span::styled(
+        " У файла нет расширения — выберите рантайм",
+        Style::default().fg(theme.file).add_modifier(Modifier::BOLD),
+    ))];
+    let us = use_unicode(width as u16);
+    for (index, (extension, hint)) in RUNTIME_ENTRIES.iter().enumerate() {
+        let marker = if index == selected {
+            if us {
+                "▸ "
+            } else {
+                "> "
+            }
+        } else {
+            "  "
+        };
+        let hint_text = match hint {
+            Some(program) => format!(" pkg: {program}"),
+            None => String::new(),
+        };
+        let text = format!(" {marker}.{extension:<8}{hint_text}");
+        let style = if index == selected {
             Style::default()
                 .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!(" {reason}"),
-            Style::default().fg(theme.muted),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(" Команда:", Style::default().fg(theme.key))),
-    ];
-    for chunk in chunk_text(command, width.saturating_sub(2))
-        .into_iter()
-        .take(4)
-    {
-        lines.push(Line::from(Span::styled(
-            format!(" {chunk}"),
-            Style::default().fg(theme.output),
-        )));
+                .bg(theme.active_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.file).bg(theme.panel)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
     }
-    lines.push(Line::from(""));
+    if let Some(error) = error {
+        lines.push(Line::from(Span::styled(
+            format!(" {error}"),
+            Style::default().fg(theme.error),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
     lines.push(Line::from(Span::styled(
-        " Запустить во внешнем терминале? [Y/n]",
-        Style::default().fg(theme.file),
-    )));
-    lines.push(Line::from(Span::styled(
-        " Enter/Y запуск · N/Esc отмена",
+        format!(
+            " {} / {} выбор · Enter запустить · Esc отмена",
+            if us { "↑↓" } else { "Up/Down" },
+            if us { "↓↑" } else { "Down/Up" }
+        ),
         Style::default().fg(theme.muted),
     )));
     lines
 }
 
-fn chunk_text(text: &str, width: usize) -> Vec<String> {
+const RUNTIME_ENTRIES: [(&str, Option<&str>); 8] = [
+    ("py", Some("python3")),
+    ("js", Some("node")),
+    ("ts", Some("tsx")),
+    ("sh", Some("bash")),
+    ("go", Some("go")),
+    ("c", Some("gcc")),
+    ("cpp", Some("g++")),
+    ("rs", Some("cargo")),
+];
+
+fn confirm_lines(app: &App, question: &str, hints: &str, width: usize) -> Vec<Line<'static>> {
+    let theme = app.theme;
+    vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            chunk_text_line(question, width),
+            Style::default()
+                .fg(theme.file)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            chunk_text_line(hints, width),
+            Style::default().fg(theme.key),
+        )),
+    ]
+}
+
+fn chunk_text_line(text: &str, width: usize) -> String {
     if width == 0 {
-        return Vec::new();
+        return text.to_string();
     }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
+    let mut result = String::new();
     let mut used = 0usize;
     for ch in text.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + char_width > width && used > 0 {
-            chunks.push(current);
-            current = String::new();
-            used = 0;
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if used + char_width > width {
+            result.push('…');
+            return result;
         }
-        current.push(ch);
+        result.push(ch);
         used += char_width;
     }
-    if !current.is_empty() || chunks.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+    result
 }

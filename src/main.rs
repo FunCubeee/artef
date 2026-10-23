@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -27,10 +27,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Mode};
+use crate::app::App;
 
 struct Cli {
-    mode: Option<Mode>,
     path: Option<PathBuf>,
 }
 
@@ -63,7 +62,7 @@ fn real_main() -> Result<(), String> {
     logging::init();
     let settings = config::load();
     let (root, initial_file) = resolve_start(cli.path)?;
-    let mut app = App::new(settings, root, cli.mode, initial_file);
+    let mut app = App::new(settings, root, initial_file);
     install_panic_hook();
     let mut terminal = setup_terminal()?;
     let loop_result = run_loop(&mut terminal, &mut app);
@@ -73,11 +72,10 @@ fn real_main() -> Result<(), String> {
 }
 
 fn parse_cli() -> Result<CliAction, String> {
-    let mut args = env::args_os().skip(1);
-    let mut mode = None;
+    let args = env::args_os().skip(1);
     let mut path = None;
     let mut positional_only = false;
-    while let Some(argument) = args.next() {
+    for argument in args {
         if !positional_only {
             let text = argument.to_string_lossy();
             if text == "--" {
@@ -90,17 +88,6 @@ fn parse_cli() -> Result<CliAction, String> {
             if text == "--version" || text == "-V" {
                 return Ok(CliAction::Version);
             }
-            if text == "--mode" || text == "-m" {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--mode требует значение ide или explorer".to_string())?;
-                mode = Some(parse_mode(&value.to_string_lossy())?);
-                continue;
-            }
-            if let Some(value) = text.strip_prefix("--mode=") {
-                mode = Some(parse_mode(value)?);
-                continue;
-            }
             if text.starts_with('-') {
                 return Err(format!("неизвестный параметр {text}; используйте --help"));
             }
@@ -110,34 +97,26 @@ fn parse_cli() -> Result<CliAction, String> {
         }
         path = Some(PathBuf::from(argument));
     }
-    Ok(CliAction::Run(Cli { mode, path }))
-}
-
-fn parse_mode(value: &str) -> Result<Mode, String> {
-    match value.to_ascii_lowercase().as_str() {
-        "ide" => Ok(Mode::Ide),
-        "explorer" | "exp" => Ok(Mode::Explorer),
-        other => Err(format!(
-            "неизвестный режим '{other}'; допустимо ide или explorer"
-        )),
-    }
+    Ok(CliAction::Run(Cli { path }))
 }
 
 fn print_help() {
     println!(
         concat!(
             "artef {}\n",
-            "Терминальный редактор и запуск программ.\n\n",
+            "Терминальный редактор и запуск программ для Termux.\n\n",
             "Использование:\n",
-            "  artef [--mode ide|explorer] [путь]\n\n",
+            "  artef [путь]\n\n",
             "Параметры:\n",
-            "  -m, --mode <ide|explorer>  начальный режим\n",
-            "  -h, --help                 показать справку\n",
-            "  -V, --version              показать версию\n\n",
+            "  -h, --help   показать справку\n",
+            "  -V, --version показать версию\n\n",
             "Путь может быть каталогом проекта или файлом для открытия.\n",
-            "Без --mode и при default_mode=\"ask\" показывается выбор режима.\n",
             "Конфиг: ~/.config/artef/config.toml\n",
-            "Лог:    ~/.local/state/artef/artef.log"
+            "Лог:    ~/.local/state/artef/artef.log\n\n",
+            "Клавиши:\n",
+            "  Ctrl+N файл · Ctrl+Shift+N папка · Ctrl+W рабочая папка\n",
+            "  Ctrl+S сохранить · Ctrl+R запустить · Ctrl+F поиск · Ctrl+G строка\n",
+            "  Tab/Ctrl+O фокус панели вывода · Ctrl+Shift+Q или F10 выход"
         ),
         env!("CARGO_PKG_VERSION")
     );
@@ -193,7 +172,13 @@ fn install_panic_hook() {
     panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            Show
+        );
+        runner::kill_registered_child();
         logging::error(&format!("паника: {info}"));
         original(info);
     }));
@@ -202,7 +187,7 @@ fn install_panic_hook() {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
     enable_raw_mode().map_err(|error| format!("не удалось включить raw mode: {error}"))?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide, EnableBracketedPaste) {
         let _ = disable_raw_mode();
         return Err(format!("не удалось открыть alternate screen: {error}"));
     }
@@ -217,7 +202,12 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        Show
+    );
     let _ = terminal.show_cursor();
 }
 
@@ -237,10 +227,12 @@ fn run_loop(
         if event::poll(Duration::from_millis(40))
             .map_err(|error| format!("ошибка ожидания ввода: {error}"))?
         {
-            match event::read().map_err(|error| format!("ошибка чтения ввода: {error}"))?
-            {
+            match event::read().map_err(|error| format!("ошибка чтения ввода: {error}"))? {
                 Event::Key(key) => app.handle_key(key),
-                Event::Resize(_, _) => {}
+                Event::Paste(text) => app.handle_paste(&text),
+                Event::Resize(width, height) => {
+                    app.runner.set_winsize(width, height.saturating_sub(2));
+                }
                 _ => {}
             }
         }

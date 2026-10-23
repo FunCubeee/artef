@@ -1,22 +1,18 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use ratatui::style::{Color, Modifier};
 use unicode_width::UnicodeWidthStr;
 
-use crate::language::Language;
-use crate::logging;
 use crate::platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutSource {
     Stdout,
-    Stderr,
     System,
     Error,
 }
@@ -61,11 +57,6 @@ pub struct RunPlan {
     pub file: PathBuf,
     pub cwd: PathBuf,
     pub command: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct GuiWarning {
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +113,7 @@ impl StreamBuffer {
                 self.current.clear();
                 self.visual_col = 0;
                 self.carriage_pending = false;
+                self.state = ParserState::Ground;
             }
 
             match self.state {
@@ -137,6 +129,7 @@ impl StreamBuffer {
                     b'\r' => {
                         self.flush_pending();
                         self.carriage_pending = true;
+                        self.state = ParserState::Ground;
                     }
                     b'\t' => {
                         self.flush_pending();
@@ -148,7 +141,7 @@ impl StreamBuffer {
                         self.flush_pending();
                         self.pop_last();
                     }
-                    value if value < 0x20 => {
+                    0x07 | 0x00..=0x06 | 0x0b..=0x17 | 0x19 | 0x1c..=0x1f => {
                         self.flush_pending();
                     }
                     value => {
@@ -166,11 +159,22 @@ impl StreamBuffer {
                         0x1b => ParserState::Escape,
                         _ => ParserState::Ground,
                     };
+                    if self.state != ParserState::Ground {
+                        index += 1;
+                        continue;
+                    }
                 }
                 ParserState::Csi => {
                     if (0x40..=0x7e).contains(&byte) {
                         if byte == b'm' {
                             self.apply_sgr();
+                        } else if byte == b'H'
+                            || byte == b'f'
+                            || byte == b'J'
+                            || byte == b'K'
+                        {
+                            self.current.clear();
+                            self.visual_col = 0;
                         }
                         self.csi.clear();
                         self.state = ParserState::Ground;
@@ -412,8 +416,7 @@ fn ansi_color(index: u8) -> Color {
 
 pub struct OutputBuffer {
     completed: Vec<OutLine>,
-    stdout: StreamBuffer,
-    stderr: StreamBuffer,
+    pty: StreamBuffer,
     pub offset: usize,
     pub follow: bool,
     pub view_height: usize,
@@ -430,8 +433,7 @@ impl OutputBuffer {
     pub fn new() -> Self {
         Self {
             completed: Vec::new(),
-            stdout: StreamBuffer::new(OutSource::Stdout),
-            stderr: StreamBuffer::new(OutSource::Stderr),
+            pty: StreamBuffer::new(OutSource::Stdout),
             offset: 0,
             follow: true,
             view_height: 10,
@@ -441,8 +443,7 @@ impl OutputBuffer {
 
     pub fn clear(&mut self) {
         self.completed.clear();
-        self.stdout = StreamBuffer::new(OutSource::Stdout);
-        self.stderr = StreamBuffer::new(OutSource::Stderr);
+        self.pty = StreamBuffer::new(OutSource::Stdout);
         self.offset = 0;
         self.follow = true;
         self.max_offset = 0;
@@ -470,19 +471,14 @@ impl OutputBuffer {
         self.trim();
     }
 
-    pub fn feed(&mut self, stderr: bool, bytes: &[u8]) {
-        if stderr {
-            self.stderr.feed(bytes, &mut self.completed);
-        } else {
-            self.stdout.feed(bytes, &mut self.completed);
-        }
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.pty.feed(bytes, &mut self.completed);
         self.trim();
     }
 
     pub fn finish_streams(&mut self) {
         let mut extra = Vec::new();
-        self.stdout.finish(&mut extra);
-        self.stderr.finish(&mut extra);
+        self.pty.finish(&mut extra);
         self.completed.extend(extra);
         self.trim();
         self.follow = true;
@@ -493,20 +489,13 @@ impl OutputBuffer {
     }
 
     pub fn partial_lines(&self) -> Vec<OutLine> {
-        let mut result = Vec::new();
-        if !self.stdout.current.is_empty() {
-            result.push(OutLine {
-                spans: self.stdout.current.clone(),
-                source: OutSource::Stdout,
-            });
+        if self.pty.current.is_empty() {
+            return Vec::new();
         }
-        if !self.stderr.current.is_empty() {
-            result.push(OutLine {
-                spans: self.stderr.current.clone(),
-                source: OutSource::Stderr,
-            });
-        }
-        result
+        vec![OutLine {
+            spans: self.pty.current.clone(),
+            source: OutSource::Stdout,
+        }]
     }
 
     pub fn note_view(&mut self, height: usize, max_offset: usize) {
@@ -550,20 +539,66 @@ impl OutputBuffer {
 }
 
 enum RunEvent {
-    Data { stderr: bool, bytes: Vec<u8> },
+    Data { bytes: Vec<u8> },
     ReaderDone,
 }
 
+static LIVE_PID: std::sync::OnceLock<std::sync::Mutex<Option<libc::pid_t>>> =
+    std::sync::OnceLock::new();
+
+fn live_pid_cell() -> &'static std::sync::Mutex<Option<libc::pid_t>> {
+    LIVE_PID.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Store the pid of the running child so panic hooks can kill it.
+pub fn register_live_pid(pid: Option<libc::pid_t>) {
+    if let Ok(mut cell) = live_pid_cell().lock() {
+        *cell = pid;
+    }
+}
+
+pub fn kill_registered_child() {
+    let pid = live_pid_cell().lock().ok().and_then(|mut cell| cell.take());
+    if let Some(pid) = pid {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        for _ in 0..60 {
+            if wait_pid(pid).is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = wait_pid(pid);
+    }
+}
+
 struct ActiveRun {
-    child: Option<Child>,
+    master_fd: i32,
+    pid: u32,
     receiver: Receiver<RunEvent>,
-    readers_left: usize,
+    reader_done: bool,
+}
+
+impl ActiveRun {
+    fn new(master_fd: i32, pid: u32, receiver: Receiver<RunEvent>) -> Self {
+        Self {
+            master_fd,
+            pid,
+            receiver,
+            reader_done: false,
+        }
+    }
 }
 
 pub struct Runner {
     pub output: OutputBuffer,
     pub exit: Option<RunExit>,
     active: Option<ActiveRun>,
+    winsize: (u16, u16),
 }
 
 impl Default for Runner {
@@ -578,6 +613,26 @@ impl Runner {
             output: OutputBuffer::new(),
             exit: None,
             active: None,
+            winsize: (80, 24),
+        }
+    }
+
+    pub fn set_winsize(&mut self, cols: u16, rows: u16) {
+        self.winsize = (cols.max(1), rows.max(1));
+        if let Some(active) = &self.active {
+            let size = libc::winsize {
+                ws_col: self.winsize.0,
+                ws_row: self.winsize.1,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            unsafe {
+                libc::ioctl(
+                    active.master_fd,
+                    libc::TIOCSWINSZ,
+                    &size as *const libc::winsize,
+                );
+            }
         }
     }
 
@@ -586,186 +641,312 @@ impl Runner {
         self.output.clear();
         self.exit = None;
         self.output.add_system(format!("$ {}", plan.command));
-        let mut command = shell_command(&plan.command);
-        command
-            .current_dir(&plan.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("PYTHONUNBUFFERED", "1")
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("FORCE_COLOR", "1")
-            .env("CLICOLOR_FORCE", "1")
-            .env_remove("NO_COLOR");
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
+        self.spawn_pty(plan)
+    }
+
+    fn spawn_pty(&mut self, plan: &RunPlan) -> Result<(), String> {
+        let shell = platform::find_program("sh")
+            .or_else(|| platform::find_program("bash"))
+            .unwrap_or_else(|| PathBuf::from("/system/bin/sh"));
+        let shell_c = c_string(&shell.to_string_lossy())?;
+        let command_c = c_string(&plan.command)?;
+        let cwd_c = c_string(&plan.cwd.to_string_lossy())?;
+        let (master_fd, slave_fd) = open_pty(self.winsize)?;
+
+        let fork_result = unsafe { libc::fork() };
+        if fork_result < 0 {
+            unsafe {
+                libc::close(master_fd);
+                libc::close(slave_fd);
+            }
+            return Err(format!("fork не удался: {}", std::io::Error::last_os_error()));
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0000_0200);
+        if fork_result == 0 {
+            unsafe {
+                libc::close(master_fd);
+                if libc::setsid() < 0 {
+                    libc::_exit(121);
+                }
+                if libc::ioctl(
+                    slave_fd,
+                    libc::TIOCSCTTY,
+                    std::ptr::null_mut::<libc::c_void>(),
+                ) < 0
+                {
+                    libc::_exit(122);
+                }
+                if libc::dup2(slave_fd, 0) < 0
+                    || libc::dup2(slave_fd, 1) < 0
+                    || libc::dup2(slave_fd, 2) < 0
+                {
+                    libc::_exit(123);
+                }
+                if slave_fd > 2 {
+                    libc::close(slave_fd);
+                }
+                if libc::chdir(cwd_c.as_ptr()) < 0 {
+                    libc::_exit(124);
+                }
+                std::env::set_var("PYTHONUNBUFFERED", "1");
+                std::env::set_var("PYTHONIOENCODING", "utf-8");
+                std::env::set_var("FORCE_COLOR", "1");
+                std::env::set_var("CLICOLOR_FORCE", "1");
+                std::env::remove_var("NO_COLOR");
+                let argv: [*const libc::c_char; 4] = [
+                    shell_c.as_ptr(),
+                    c"-c".as_ptr(),
+                    command_c.as_ptr(),
+                    std::ptr::null(),
+                ];
+                libc::execv(shell_c.as_ptr(), argv.as_ptr().cast_mut());
+                libc::_exit(127);
+            }
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("не удалось запустить программу: {error}"))?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let (sender, receiver) = mpsc::channel();
-        let mut readers = 0usize;
-        if let Some(stream) = stdout {
-            readers += 1;
+
+        let pid = fork_result as u32;
+        unsafe {
+            libc::close(slave_fd);
+        }
+        register_live_pid(Some(pid as libc::pid_t));
+
+        let (sender, receiver) = mpsc::channel::<RunEvent>();
+        {
             let sender = sender.clone();
             thread::spawn(move || {
-                read_stream(stream, false, sender);
+                read_pty(master_fd, sender);
             });
         }
-        if let Some(stream) = stderr {
-            readers += 1;
-            let sender = sender.clone();
-            thread::spawn(move || {
-                read_stream(stream, true, sender);
-            });
-        }
-        drop(sender);
         self.output.follow = true;
-        self.active = Some(ActiveRun {
-            child: Some(child),
-            receiver,
-            readers_left: readers,
-        });
+        self.active = Some(ActiveRun::new(master_fd, pid, receiver));
         Ok(())
     }
 
     pub fn tick(&mut self) {
         let finished;
+        let mut drained = false;
         {
             let Some(active) = self.active.as_mut() else {
                 return;
             };
             loop {
                 match active.receiver.try_recv() {
-                    Ok(RunEvent::Data { stderr, bytes }) => {
-                        self.output.feed(stderr, &bytes);
+                    Ok(RunEvent::Data { bytes }) => {
+                        self.output.feed(&bytes);
                     }
                     Ok(RunEvent::ReaderDone) => {
-                        active.readers_left = active.readers_left.saturating_sub(1);
+                        active.reader_done = true;
+                        break;
                     }
-                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Empty) => {
+                        drained = true;
+                        break;
+                    }
                     Err(TryRecvError::Disconnected) => {
-                        active.readers_left = 0;
+                        active.reader_done = true;
                         break;
                     }
                 }
             }
 
-            if let Some(child) = active.child.as_mut() {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let exit = RunExit {
-                            code: status.code(),
-                            success: status.success(),
-                        };
-                        self.exit = Some(exit);
-                        active.child = None;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        logging::error(&format!("ошибка ожидания процесса: {error}"));
-                        active.child = None;
-                        self.exit = Some(RunExit {
-                            code: None,
-                            success: false,
-                        });
-                    }
+            if active.reader_done && active.master_fd >= 0 {
+                unsafe {
+                    libc::close(active.master_fd);
+                }
+                active.master_fd = -1;
+            }
+
+            if let Some(exit) = wait_pid(active.pid as libc::pid_t) {
+                register_live_pid(None);
+                if self.exit.is_none() {
+                    self.exit = Some(exit);
                 }
             }
 
-            finished = active.readers_left == 0 && active.child.is_none();
+            let exited = self.exit.is_some();
+            finished = exited && active.reader_done;
+            let _ = drained;
         }
         if finished {
             self.output.finish_streams();
             self.active = None;
+            if let Some(exit) = self.exit {
+                if exit.success {
+                    self.output.add_system("[artef] процесс завершён успешно");
+                } else {
+                    let code = match exit.code {
+                        Some(code) => code.to_string(),
+                        None => "сигнал".to_string(),
+                    };
+                    self.output.add_system(format!("[artef] процесс завершился, код {code}"));
+                }
+            }
         }
     }
 
     pub fn is_running(&self) -> bool {
-        self.active
-            .as_ref()
-            .and_then(|active| active.child.as_ref())
-            .is_some()
+        self.active.is_some() && self.exit.is_none()
+    }
+
+    pub fn send_input(&mut self, bytes: &[u8]) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        if active.master_fd < 0 {
+            return;
+        }
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let count = unsafe {
+                libc::write(
+                    active.master_fd,
+                    bytes[written..].as_ptr().cast(),
+                    bytes.len() - written,
+                )
+            };
+            if count <= 0 {
+                break;
+            }
+            written += count as usize;
+        }
     }
 
     pub fn shutdown(&mut self) {
-        let Some(active) = self.active.as_mut() else {
+        let Some(mut active) = self.active.take() else {
             return;
         };
-        if let Some(mut child) = active.child.take() {
-            let pid = child.id();
-            terminate_process(&mut child, pid);
+        let deadline = Instant::now() + Duration::from_millis(600);
+        unsafe {
+            libc::kill(active.pid as i32, libc::SIGTERM);
         }
-        self.active = None;
+        register_live_pid(None);
+        loop {
+            if wait_pid(active.pid as libc::pid_t).is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(active.pid as i32, libc::SIGKILL);
+                }
+                let _ = wait_pid(active.pid as libc::pid_t);
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        if active.master_fd >= 0 {
+            unsafe {
+                libc::close(active.master_fd);
+            }
+            active.master_fd = -1;
+        }
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while let Ok(event) = active.receiver.try_recv() {
+            match event {
+                RunEvent::Data { bytes } => {
+                    self.output.feed(&bytes);
+                }
+                _ => break,
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if !self.output.partial_lines().is_empty() {
+            self.output.finish_streams();
+        }
+        if self.exit.is_none() {
+            self.exit = Some(RunExit {
+                code: None,
+                success: false,
+            });
+            self.output.add_system("[artef] процесс остановлен (прерван)");
+        }
     }
 }
 
-fn read_stream(mut stream: impl Read, stderr: bool, sender: mpsc::Sender<RunEvent>) {
+fn read_pty(fd: i32, sender: mpsc::Sender<RunEvent>) {
     let mut buffer = [0u8; 8192];
     loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                if sender
-                    .send(RunEvent::Data {
-                        stderr,
-                        bytes: buffer[..count].to_vec(),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Err(error) => {
-                logging::error(&format!("ошибка чтения вывода: {error}"));
-                break;
-            }
+        let count = unsafe {
+            libc::read(
+                fd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if count <= 0 {
+            break;
+        }
+        let count = count as usize;
+        if sender
+            .send(RunEvent::Data {
+                bytes: buffer[..count].to_vec(),
+            })
+            .is_err()
+        {
+            break;
         }
     }
     let _ = sender.send(RunEvent::ReaderDone);
 }
 
-fn terminate_process(child: &mut Child, pid: u32) {
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+fn open_pty(winsize: (u16, u16)) -> Result<(i32, i32), String> {
+    unsafe {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let ws = libc::winsize {
+            ws_col: winsize.0,
+            ws_row: winsize.1,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws) < 0
+        {
+            return Err(format!(
+                "openpty не удался: {}",
+                std::io::Error::last_os_error()
+            ));
         }
+        Ok((master, slave))
     }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
 }
 
-fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut process = Command::new("cmd.exe");
-        process.args(["/C", command]);
-        process
-    }
-    #[cfg(not(windows))]
-    {
-        let shell = platform::find_program("sh").unwrap_or_else(|| PathBuf::from("sh"));
-        let mut process = Command::new(shell);
-        process.arg("-c").arg(command);
-        process
+fn c_string(value: &str) -> Result<std::ffi::CString, String> {
+    std::ffi::CString::new(value.as_bytes())
+        .map_err(|error| format!("недопустимый байт в пути или команде: {error}"))
+}
+
+fn wait_pid(pid: libc::pid_t) -> Option<RunExit> {
+    unsafe {
+        let mut status: libc::c_int = 0;
+        let result = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if result == 0 {
+            return None;
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return None;
+            }
+            return Some(RunExit {
+                code: None,
+                success: false,
+            });
+        }
+        if libc::WIFEXITED(status) {
+            let code = libc::WEXITSTATUS(status);
+            return Some(RunExit {
+                code: Some(code),
+                success: code == 0,
+            });
+        }
+        if libc::WIFSIGNALED(status) {
+            return Some(RunExit {
+                code: None,
+                success: false,
+            });
+        }
+        None
     }
 }
 
@@ -785,13 +966,23 @@ pub fn build_plan(
     if extension.is_empty() {
         return Err("у файла нет расширения, правило запуска не найдено".to_string());
     }
+    let plan = plan_for_extension(file, &extension, run_rules, workspace_root)?;
+    Ok(plan)
+}
+
+pub fn plan_for_extension(
+    file: &Path,
+    extension: &str,
+    run_rules: &BTreeMap<String, String>,
+    workspace_root: &Path,
+) -> Result<RunPlan, String> {
     let cargo_root = find_cargo_root(file);
     let mut template = run_rules
         .get(&format!(".{extension}"))
-        .or_else(|| run_rules.get(&extension))
+        .or_else(|| run_rules.get(extension))
         .cloned()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default_template(&extension).to_string());
+        .unwrap_or_else(|| default_template(extension).to_string());
     if template.trim().is_empty() {
         return Err(format!("для .{extension} нет правила запуска"));
     }
@@ -807,29 +998,15 @@ pub fn build_plan(
     let run_cwd = if extension == "rs" {
         cargo_root.clone().unwrap_or_else(|| file_dir.clone())
     } else {
-        file_dir.clone()
+        workspace_root.to_path_buf()
     };
     let temp = temporary_executable(file);
     let mut substitutions: Vec<(&str, String)> = vec![
         ("{file}", platform::quote_arg(file.as_os_str())),
         ("{dir}", platform::quote_arg(file_dir.as_os_str())),
-        (
-            "{name}",
-            platform::quote_str(
-                file.file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(""),
-            ),
-        ),
-        (
-            "{stem}",
-            platform::quote_str(
-                file.file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(""),
-            ),
-        ),
-        ("{ext}", extension.clone()),
+        ("{name}", platform::quote_str(&file_name_text(file))),
+        ("{stem}", platform::quote_str(&file_stem_text(file))),
+        ("{ext}", extension.to_string()),
         ("{temp}", platform::quote_arg(temp.as_os_str())),
     ];
 
@@ -870,13 +1047,7 @@ fn default_template(extension: &str) -> &'static str {
 
 fn resolve_program_token(token: &str) -> Result<String, String> {
     let candidates: &[&str] = match token {
-        "{python}" => {
-            if cfg!(windows) {
-                &["python", "python3"]
-            } else {
-                &["python3", "python"]
-            }
-        }
+        "{python}" => &["python3", "python"],
         "{node}" => &["node"],
         "{tsx}" => &["tsx", "node"],
         "{bash}" => &["bash", "sh"],
@@ -894,7 +1065,7 @@ fn resolve_program_token(token: &str) -> Result<String, String> {
     }
     let label = token.trim_matches(|ch| ch == '{' || ch == '}');
     Err(format!(
-        "не найдена программа '{label}', установите её и повторите запуск"
+        "не найдена программа '{label}', установите её и повторите запуск (pkg install {label})"
     ))
 }
 
@@ -951,104 +1122,90 @@ fn temporary_executable(file: &Path) -> PathBuf {
             }
         })
         .collect();
-    let path = std::env::temp_dir().join(format!("artef-{}-{}", std::process::id(), stem));
-    #[cfg(windows)]
-    let path = {
-        let mut path = path;
-        path.set_extension("exe");
-        path
-    };
-    path
+    std::env::temp_dir().join(format!("artef-{}-{}", std::process::id(), stem))
 }
 
-pub fn gui_warning(file: &Path, language: Language, content: &str) -> Option<GuiWarning> {
-    let lower = content.to_ascii_lowercase();
-    let tokens: &[&str] = match language {
-        Language::Python => &[
-            "tkinter",
-            "pygame",
-            "pyqt",
-            "pyside",
-            "kivy",
-            "wxpython",
-            "urwid",
-            "npyscreen",
-            "textual.app",
-            "turtle",
-            "matplotlib.pyplot",
-            "curses",
-        ],
-        Language::JavaScript | Language::TypeScript => &[
-            "electron",
-            "react-native",
-            "blessed",
-            "neo-blessed",
-            "from 'ink'",
-            "from \"ink\"",
-            "browser-window",
-        ],
-        Language::Rust => &[
-            "eframe",
-            "egui",
-            "iced",
-            "tauri",
-            "gtk",
-            "winit",
-            "bevy",
-            "minifb",
-            "sdl2",
-            "ratatui",
-            "crossterm",
-            "windows_subsystem",
-        ],
-        Language::Go => &[
-            "fyne.io",
-            "ebiten",
-            "gioui",
-            "tcell",
-            "bubbletea",
-            "termui",
-            "gocui",
-        ],
-        Language::C | Language::Cpp => &[
-            "sdl_",
-            "<sdl",
-            "<gtk",
-            "<qapplication",
-            "<qwidget",
-            "<x11",
-            "<ncurses",
-            "<curses",
-            "winmain",
-            "createwindow",
-        ],
-        Language::Shell => &["whiptail", "dialog ", "ncurses"],
-        _ => &[],
-    };
-    for token in tokens {
-        if lower.contains(token) {
-            return Some(GuiWarning {
-                reason: format!("обнаружено `{token}`"),
-            });
+pub fn shebang_command(file: &Path) -> Option<String> {
+    let content = fs::read_to_string(file).ok()?;
+    let first = content.lines().next()?;
+    if !first.starts_with("#!") {
+        return None;
+    }
+    let shebang = first.trim_start_matches("#!").trim();
+    if shebang.is_empty() {
+        return None;
+    }
+    if shebang.contains("env ") {
+        let mut parts = shebang.split_whitespace();
+        let _env = parts.next()?;
+        let interpreter = parts.next()?;
+        let mut command = format!("{interpreter} {file:?}");
+        for argument in parts {
+            command.push(' ');
+            command.push_str(argument);
+        }
+        return Some(command);
+    }
+    Some(format!("{shebang} {file:?}"))
+}
+
+fn file_name_text(file: &Path) -> String {
+    file.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn file_stem_text(file: &Path) -> String {
+    file.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_templates_cover_popular_extensions() {
+        for extension in ["py", "js", "ts", "go", "c", "cpp", "sh"] {
+            assert!(
+                !default_template(extension).is_empty(),
+                "нет шаблона для {extension}"
+            );
         }
     }
-    if language == Language::Rust {
-        if let Some(root) = find_cargo_root(file) {
-            let manifest = root.join("Cargo.toml");
-            if let Ok(text) = fs::read_to_string(manifest) {
-                let manifest_lower = text.to_ascii_lowercase();
-                let gui_tokens = [
-                    "egui", "eframe", "iced", "tauri", "gtk", "winit", "bevy", "sdl2", "minifb",
-                ];
-                for token in gui_tokens {
-                    if manifest_lower.contains(token) {
-                        return Some(GuiWarning {
-                            reason: format!("Cargo.toml содержит `{token}`"),
-                        });
-                    }
-                }
-            }
-        }
+
+    #[test]
+    fn substitute_replaces_tokens() {
+        let result = substitute(
+            "{python} -u {file}",
+            &[("{python}", "py".into()), ("{file}", "main.py".into())],
+        );
+        assert_eq!(result, "py -u main.py");
     }
-    None
+
+    #[test]
+    fn output_buffer_wraps_carriage_rewrites() {
+        let mut buffer = OutputBuffer::new();
+        buffer.feed(b"\x1b[1;32mloading\x1b[0m\r\x08\x1b[K\r done\n");
+        buffer.finish_streams();
+        let lines = buffer.completed();
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn shebang_or_none() {
+        let dir = std::env::temp_dir().join(format!("artef-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let path = dir.join("launcher");
+        fs::write(&path, "#!/usr/bin/env python3\nprint(1)\n").unwrap();
+        let command = shebang_command(&path).unwrap();
+        assert!(command.starts_with("python3"), "команда: {command}");
+        let plain = dir.join("nobody");
+        fs::write(&plain, "print(2)\n").unwrap();
+        assert!(shebang_command(&plain).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
 }

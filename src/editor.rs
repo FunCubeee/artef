@@ -32,6 +32,7 @@ pub struct Editor {
     pub anchor: Option<Position>,
     pub scroll: usize,
     pub x_scroll: usize,
+    pub wrap: bool,
     pub modified: bool,
     pub revision: u64,
     pub language: Language,
@@ -41,6 +42,7 @@ pub struct Editor {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     dismissed_ghost: Option<(usize, usize, String)>,
+    visual_cache: Option<(u64, usize, Vec<usize>)>,
 }
 
 impl Default for Editor {
@@ -53,6 +55,7 @@ impl Default for Editor {
             anchor: None,
             scroll: 0,
             x_scroll: 0,
+            wrap: false,
             modified: false,
             revision: 1,
             language: Language::Plain,
@@ -62,6 +65,7 @@ impl Default for Editor {
             undo: Vec::new(),
             redo: Vec::new(),
             dismissed_ghost: None,
+            visual_cache: None,
         }
     }
 }
@@ -91,6 +95,7 @@ impl Editor {
             anchor: None,
             scroll: 0,
             x_scroll: 0,
+            wrap: false,
             modified: false,
             revision: 1,
             language,
@@ -100,6 +105,7 @@ impl Editor {
             undo: Vec::new(),
             redo: Vec::new(),
             dismissed_ghost: None,
+            visual_cache: None,
         })
     }
 
@@ -157,10 +163,6 @@ impl Editor {
             .map_err(|error| format!("не удалось сохранить {}: {error}", path.display()))?;
         self.modified = false;
         Ok(())
-    }
-
-    pub fn display_text(&self) -> String {
-        self.lines.join("\n")
     }
 
     pub fn set_search(&mut self, query: Option<String>) {
@@ -255,12 +257,12 @@ impl Editor {
     }
 
     pub fn paste(&mut self, clipboard: &str) -> bool {
-        if clipboard.is_empty() {
+        let normalized = sanitize_text(clipboard);
+        if normalized.is_empty() {
             return false;
         }
         self.record_undo();
         self.delete_selection_raw();
-        let normalized = clipboard.replace("\r\n", "\n").replace('\r', "\n");
         self.insert_text_raw(&normalized);
         self.after_edit();
         true
@@ -496,6 +498,65 @@ impl Editor {
         result
     }
 
+    pub fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+        if !self.wrap {
+            self.x_scroll = 0;
+        }
+    }
+
+    pub fn cursor_row_number(&self) -> usize {
+        self.cursor_line + 1
+    }
+
+    pub fn column_number(&self) -> usize {
+        self.cursor_col + 1
+    }
+
+    /// Visual-row start per logical line, cached per (revision, width).
+    pub fn visual_starts(&mut self, code_width: usize) -> &[usize] {
+        let width = code_width.max(1);
+        if let Some((cached_revision, cached_width)) = self
+            .visual_cache
+            .as_ref()
+            .map(|(revision, width, _)| (*revision, *width))
+        {
+            if cached_revision == self.revision && cached_width == width {
+                return match self.visual_cache.as_ref() {
+                    Some((_, _, cached)) => cached,
+                    None => unreachable!(),
+                };
+            }
+        }
+        let mut starts = Vec::with_capacity(self.lines.len() + 1);
+        let mut total = 0usize;
+        for line in &self.lines {
+            starts.push(total);
+            total += wrap_ranges(line, width, self.tab_width).len();
+        }
+        starts.push(total);
+        self.visual_cache = Some((self.revision, width, starts));
+        match self.visual_cache.as_ref() {
+            Some((_, _, cached)) => cached,
+            None => unreachable!(),
+        }
+    }
+
+    pub fn cursor_row_offset(&self) -> usize {
+        let Some(text) = self.lines.get(self.cursor_line) else {
+            return 0;
+        };
+        let ranges = wrap_ranges(text, usize::MAX, self.tab_width);
+        let mut offset = 0usize;
+        for (start, end) in ranges {
+            if self.cursor_col >= start && self.cursor_col <= end {
+                return offset;
+            }
+            offset += 1;
+        }
+        offset
+    }
+
     fn word_prefix(&self) -> Option<(usize, usize, String)> {
         let line = self.lines.get(self.cursor_line)?;
         let chars: Vec<char> = line.chars().collect();
@@ -612,6 +673,80 @@ impl Editor {
     }
 }
 
+/// Strip C0 control chars (keep `\n`, `\t`), normalise `\r` to `\n`.
+pub fn sanitize_text(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            result.push('\n');
+            continue;
+        }
+        if (ch as u32) < 0x20 && ch != '\n' && ch != '\t' {
+            continue;
+        }
+        if ch == '\u{7f}' {
+            continue;
+        }
+        result.push(ch);
+    }
+    result
+}
+
+/// Word-aware greedy wrap ranges of a line in char-index space, tab atomic.
+pub fn wrap_ranges(text: &str, width: usize, tab_width: usize) -> Vec<(usize, usize)> {
+    let chars: Vec<(char, usize)> = text
+        .chars()
+        .map(|ch| {
+            let w = if ch == '\t' {
+                0
+            } else {
+                unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
+            };
+            (ch, w)
+        })
+        .collect();
+    if width == 0 {
+        return vec![(0, chars.len())];
+    }
+    let tab_width = tab_width.max(1);
+    let mut ranges = Vec::new();
+    let mut row_start = 0usize;
+    let mut x = 0usize;
+    for index in 0..chars.len() {
+        let (ch, mut w) = chars[index];
+        if ch == '\t' {
+            w = tab_width - (x % tab_width);
+        }
+        if x + w > width && index > row_start {
+            let mut break_at = index;
+            let mut scan = index;
+            while scan > row_start && is_breakable(chars[scan - 1].0) {
+                scan -= 1;
+            }
+            if scan > row_start {
+                break_at = scan;
+            }
+            ranges.push((row_start, break_at));
+            row_start = break_at;
+            x = 0;
+            if ch == '\t' {
+                w = tab_width;
+            }
+        }
+        x += w;
+    }
+    ranges.push((row_start, chars.len()));
+    ranges
+}
+
+fn is_breakable(ch: char) -> bool {
+    ch == ' ' || ch == '\t'
+}
+
 fn char_to_byte(text: &str, column: usize) -> usize {
     if column == 0 {
         return 0;
@@ -624,4 +759,73 @@ fn char_to_byte(text: &str, column: usize) -> usize {
 
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_normalises_newlines_and_strips_controls() {
+        let text = "a\r\nb\rcd\u{1}\u{1b}[f\tg";
+        assert_eq!(sanitize_text(text), "a\nb\ncd[f\tg");
+    }
+
+    #[test]
+    fn paste_replaces_buffer_atomically() {
+        let mut editor = Editor::default();
+        editor.paste("one\ntwo\nthree\n");
+        assert_eq!(editor.line_count(), 4);
+        assert_eq!(editor.lines[0], "one");
+        assert_eq!(editor.lines[2], "three");
+        assert_eq!(editor.cursor_line, 3);
+        assert_eq!(editor.cursor_col, 0);
+        assert!(editor.modified);
+        assert_eq!(editor.revision, 2);
+        assert_eq!(editor.undo.len(), 1);
+        assert!(editor.undo());
+        assert_eq!(editor.line_count(), 1);
+    }
+
+    #[test]
+    fn wrap_ranges_break_long_lines() {
+        let ranges = wrap_ranges("abcdefgh", 3, 4);
+        assert_eq!(
+            ranges,
+            vec![(0, 3), (3, 6), (6, 8)]
+        );
+    }
+
+    #[test]
+    fn wrap_ranges_empty_line_is_single_row() {
+        assert_eq!(wrap_ranges("", 10, 4), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn wrap_ranges_expands_tabs_atomically() {
+        let ranges = wrap_ranges("\t\tx", 5, 4);
+        assert_eq!(ranges, vec![(0, 1), (1, 3)]);
+    }
+
+    #[test]
+    fn visual_starts_counts_rows_per_line() {
+        let mut editor = Editor::default();
+        editor.lines = vec!["x".repeat(10), String::new(), "y".repeat(3)];
+        let starts = editor.visual_starts(4).to_vec();
+        assert_eq!(starts, vec![0, 3, 4, 5]);
+        editor.revision = 77;
+        editor.visual_starts(4);
+        editor.cursor_line = 0;
+        assert_eq!(editor.cursor_row_offset(), 0);
+    }
+
+    #[test]
+    fn cursor_double_undo_past_paste() {
+        let mut editor = Editor::default();
+        editor.paste("alpha\nbeta\n");
+        assert!(editor.undo());
+        assert_eq!(editor.lines.len(), 1);
+        assert!(editor.redo());
+        assert_eq!(editor.lines.len(), 3);
+    }
 }
