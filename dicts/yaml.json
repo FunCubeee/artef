@@ -1,0 +1,19 @@
+{
+  "language": "YAML",
+  "extensions": [".yaml", ".yml"],
+  "prefixes": {
+    "tr": "ue",
+    "fa": "lse",
+    "nu": "ll",
+    "na": "me: value",
+    "ve": "rsion: 1.0",
+    "de": "scription: text",
+    "en": "abled: true",
+    "im": "age: name:latest",
+    "po": "rts: []",
+    "se": "rvices:",
+    "ru": "ns:",
+    "st": "eps:",
+    "ke": "y: value"
+  }
+}

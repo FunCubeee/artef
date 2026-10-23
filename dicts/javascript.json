@@ -1,0 +1,33 @@
+{
+  "language": "JavaScript",
+  "extensions": [".js", ".jsx", ".mjs", ".cjs"],
+  "prefixes": {
+    "co": "nsole.log(value);",
+    "con": "st value = null;",
+    "cons": "ole.log(value);",
+    "fu": "nction name() {}",
+    "le": "t value = null;",
+    "va": "r value = null;",
+    "if": " (condition) {}",
+    "el": "se {}",
+    "fo": "r (const item of items) {}",
+    "wh": "ile (condition) {}",
+    "re": "turn value;",
+    "im": "port { name } from 'module';",
+    "ex": "port default name;",
+    "as": "ync function name() {}",
+    "aw": "ait promise;",
+    "ar": "ray.map((item) => item);",
+    "do": "cument.querySelector(selector);",
+    "wi": "ndow.addEventListener('event', handler);",
+    "tr": "y { code(); } catch (error) {}",
+    "ty": "peof value",
+    "cl": "ass Name {}",
+    "ne": "w Name()",
+    "th": "row new Error('message');",
+    "sw": "itch (value) { default: break; }",
+    "js": "on.stringify(value)",
+    "fe": "tch(url).then((response) => response.json());",
+    "se": "tTimeout(() => {}, 1000);"
+  }
+}

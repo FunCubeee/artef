@@ -1,0 +1,15 @@
+{
+  "language": "JSON",
+  "extensions": [".json", ".jsonc"],
+  "prefixes": {
+    "tr": "ue",
+    "fa": "lse",
+    "nu": "ll",
+    "na": "me",
+    "ve": "rsion",
+    "de": "scription",
+    "ty": "pe",
+    "it": "ems",
+    "va": "lue"
+  }
+}

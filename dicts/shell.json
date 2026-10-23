@@ -1,0 +1,27 @@
+{
+  "language": "Shell",
+  "extensions": [".sh", ".bash", ".zsh"],
+  "prefixes": {
+    "ec": "ho \"$value\"",
+    "pr": "intf '%s\\n' \"$value\"",
+    "if": " [ condition ]; then",
+    "el": "se",
+    "fo": "r item in list; do",
+    "wh": "ile condition; do",
+    "ca": "se \"$value\" in",
+    "fu": "nction name() {",
+    "ex": "port VAR=\"value\"",
+    "re": "ad -r value",
+    "lo": "cal value=\"\"",
+    "se": "t -euo pipefail",
+    "cd": " \"$(dirname \"$0\")\"",
+    "va": "r=\"$1\"",
+    "ar": "g=\"$1\"",
+    "co": "mmand -v name >/dev/null 2>&1",
+    "tr": "ap 'cleanup' EXIT",
+    "mk": "dir -p directory",
+    "ch": "mod +x file",
+    "gr": "ep -R pattern directory",
+    "fin": "d . -name '*.txt' -type f"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "language": "Go",
+  "extensions": [".go"],
+  "prefixes": {
+    "pa": "ckage main",
+    "fu": "nc main() {}",
+    "im": "port \"fmt\"",
+    "pf": "rintln(value)",
+    "pr": "intf(\"%v\\n\", value)",
+    "va": "r name Type",
+    "co": "nst Name = value",
+    "if": " err != nil {}",
+    "fo": "r _, item := range items {}",
+    "sw": "itch value { default: }",
+    "st": "ruct Name {}",
+    "ty": "pe Name struct {}",
+    "in": "terface Name {}",
+    "ma": "p[string]int{}",
+    "re": "turn value, nil",
+    "de": "fer file.Close()",
+    "go": " func() {}()",
+    "er": "r := error",
+    "ch": "an := make(chan Type)",
+    "se": "lect {}",
+    "ra": "nge items",
+    "sl": "ice := []Type{}"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "language": "TOML",
+  "extensions": [".toml"],
+  "prefixes": {
+    "na": "me = \"value\"",
+    "ve": "rsion = \"1.0.0\"",
+    "des": "cription = \"text\"",
+    "tr": "ue",
+    "fa": "lse",
+    "ed": "ition = \"2021\"",
+    "au": "thors = [\"name\"]",
+    "dep": "endencies = []",
+    "pa": "th = \"/path\"",
+    "en": "abled = true",
+    "ke": "y = \"value\"",
+    "st": "ring = \"value\"",
+    "nu": "mber = 0",
+    "ar": "ray = [1, 2, 3]"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "language": "C",
+  "extensions": [".c", ".h"],
+  "prefixes": {
+    "pr": "intf(\"%d\\n\", value);",
+    "in": "t main(void) { return 0; }",
+    "re": "turn 0;",
+    "fo": "r (int i = 0; i < n; i++) {}",
+    "wh": "ile (condition) {}",
+    "if": " (condition) {}",
+    "el": "se {}",
+    "sw": "itch (value) { default: break; }",
+    "st": "ruct Name {};",
+    "ty": "pedef struct Name Name;",
+    "si": "zeof(value)",
+    "ma": "lloc(sizeof(Type))",
+    "ca": "lloc(count, sizeof(Type))",
+    "fr": "ee(pointer);",
+    "fg": "ets(buffer, size, file);",
+    "sc": "anf(\"%d\", &value);",
+    "str": "len(text)",
+    "me": "mset(buffer, 0, size);",
+    "co": "nst char *text = \"value\";",
+    "un": "signed int value = 0;",
+    "vo": "id function(void) {}",
+    "ex": "it(EXIT_SUCCESS);"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "language": "Markdown",
+  "extensions": [".md", ".markdown"],
+  "prefixes": {
+    "he": "ading",
+    "su": "mmary",
+    "de": "scription",
+    "in": "troduction",
+    "co": "nclusion",
+    "ex": "ample",
+    "no": "tes",
+    "us": "age",
+    "ins": "tallation",
+    "conf": "iguration",
+    "re": "quirements",
+    "do": "cumentation"
+  }
+}

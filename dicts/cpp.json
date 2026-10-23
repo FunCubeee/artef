@@ -1,0 +1,27 @@
+{
+  "language": "C++",
+  "extensions": [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
+  "prefixes": {
+    "std": "::cout << value << std::endl;",
+    "ci": "n >> value;",
+    "ve": "ctor<int> values;",
+    "str": "ing text = \"value\";",
+    "au": "to value = items.begin();",
+    "fo": "r (const auto &item : items) {}",
+    "if": " (condition) {}",
+    "wh": "ile (condition) {}",
+    "cl": "ass Name {};",
+    "stru": "ct Name {};",
+    "na": "mespace name {}",
+    "te": "mplate <typename T>",
+    "un": "ique_ptr<Type> value;",
+    "sh": "ared_ptr<Type> value;",
+    "ma": "ke_unique<Type>()",
+    "vi": "rtual void function() = 0;",
+    "pu": "blic:",
+    "pr": "ivate:",
+    "co": "nst auto &value = items;",
+    "in": "t main() { return 0; }",
+    "tr": "y {} catch (const std::exception &error) {}"
+  }
+}

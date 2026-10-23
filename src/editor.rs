@@ -1,0 +1,627 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::dictionary::Dictionary;
+use crate::language::Language;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Snapshot {
+    lines: Vec<String>,
+    cursor_line: usize,
+    cursor_col: usize,
+    anchor: Option<Position>,
+    modified: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GhostSuggestion {
+    pub completion: String,
+}
+
+pub struct Editor {
+    pub path: Option<PathBuf>,
+    pub lines: Vec<String>,
+    pub cursor_line: usize,
+    pub cursor_col: usize,
+    pub anchor: Option<Position>,
+    pub scroll: usize,
+    pub x_scroll: usize,
+    pub modified: bool,
+    pub revision: u64,
+    pub language: Language,
+    pub search: Option<String>,
+    pub tab_width: usize,
+    dictionary: Dictionary,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    dismissed_ghost: Option<(usize, usize, String)>,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
+            path: None,
+            lines: vec![String::new()],
+            cursor_line: 0,
+            cursor_col: 0,
+            anchor: None,
+            scroll: 0,
+            x_scroll: 0,
+            modified: false,
+            revision: 1,
+            language: Language::Plain,
+            search: None,
+            tab_width: 4,
+            dictionary: Dictionary::default(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dismissed_ghost: None,
+        }
+    }
+}
+
+impl Editor {
+    pub fn open(path: &Path, tab_width: usize) -> Result<Self, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("не удалось открыть {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{} не является файлом", path.display()));
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|error| format!("не удалось прочитать {}: {error}", path.display()))?;
+        let content = content.replace("\r\n", "\n").replace('\r', "\n");
+        let lines: Vec<String> = content.split('\n').map(|line| line.to_string()).collect();
+        let language = Language::from_path(path);
+        let dictionary = Dictionary::load(language);
+        Ok(Self {
+            path: Some(path.to_path_buf()),
+            lines: if lines.is_empty() {
+                vec![String::new()]
+            } else {
+                lines
+            },
+            cursor_line: 0,
+            cursor_col: 0,
+            anchor: None,
+            scroll: 0,
+            x_scroll: 0,
+            modified: false,
+            revision: 1,
+            language,
+            search: None,
+            tab_width: tab_width.max(1),
+            dictionary,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dismissed_ghost: None,
+        })
+    }
+
+    pub fn has_file(&self) -> bool {
+        self.path.is_some()
+    }
+
+    pub fn file_name(&self) -> Option<String> {
+        self.path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn current_line(&self) -> &str {
+        self.lines
+            .get(self.cursor_line)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub fn cursor(&self) -> Position {
+        Position {
+            line: self.cursor_line,
+            col: self.cursor_col,
+        }
+    }
+
+    pub fn selection(&self) -> Option<(Position, Position)> {
+        let anchor = self.anchor?;
+        let start = Position {
+            line: self.cursor_line,
+            col: self.cursor_col,
+        };
+        if anchor == start {
+            return None;
+        }
+        if (anchor.line, anchor.col) < (start.line, start.col) {
+            Some((anchor, start))
+        } else {
+            Some((start, anchor))
+        }
+    }
+
+    pub fn save(&mut self) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Err("файл не открыт".to_string());
+        };
+        let content = self.lines.join("\n");
+        fs::write(path, content)
+            .map_err(|error| format!("не удалось сохранить {}: {error}", path.display()))?;
+        self.modified = false;
+        Ok(())
+    }
+
+    pub fn display_text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    pub fn set_search(&mut self, query: Option<String>) {
+        self.search = query.filter(|value| !value.is_empty());
+    }
+
+    pub fn find_next(&mut self, query: &str, advance: bool) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return None;
+        }
+        let needle: Vec<char> = query.chars().collect();
+        let mut matches = Vec::new();
+        for (line_index, line) in self.lines.iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            if needle.is_empty() || chars.len() < needle.len() {
+                continue;
+            }
+            for start in 0..=chars.len() - needle.len() {
+                if chars[start..start + needle.len()] == needle[..] {
+                    matches.push((line_index, start));
+                }
+            }
+        }
+        if matches.is_empty() {
+            return None;
+        }
+        let current = (self.cursor_line, self.cursor_col);
+        let next = matches
+            .iter()
+            .copied()
+            .find(|position| {
+                if advance {
+                    *position > current
+                } else {
+                    *position >= current
+                }
+            })
+            .or_else(|| matches.first().copied());
+        if let Some((line, col)) = next {
+            self.cursor_line = line;
+            self.cursor_col = col;
+            self.anchor = None;
+            self.dismissed_ghost = None;
+            Some((line, col))
+        } else {
+            None
+        }
+    }
+
+    pub fn goto_line(&mut self, one_based: usize) {
+        let line = one_based
+            .saturating_sub(1)
+            .min(self.lines.len().saturating_sub(1));
+        self.cursor_line = line;
+        self.cursor_col = 0;
+        self.anchor = None;
+        self.dismissed_ghost = None;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        if start.line == end.line {
+            let chars: Vec<char> = self.lines[start.line].chars().collect();
+            let begin = start.col.min(chars.len());
+            let finish = end.col.min(chars.len());
+            return Some(chars[begin..finish].iter().collect());
+        }
+        let mut result = String::new();
+        let first: Vec<char> = self.lines[start.line].chars().collect();
+        result.extend(first.iter().skip(start.col));
+        for line in &self.lines[start.line + 1..end.line] {
+            result.push('\n');
+            result.push_str(line);
+        }
+        result.push('\n');
+        let last: Vec<char> = self.lines[end.line].chars().collect();
+        result.extend(last.iter().take(end.col.min(last.len())));
+        Some(result)
+    }
+
+    pub fn copy_to_clipboard(&self, clipboard: &mut String) -> bool {
+        if let Some(selection) = self.selected_text() {
+            *clipboard = selection;
+            true
+        } else {
+            if self.current_line().is_empty() {
+                return false;
+            }
+            *clipboard = self.current_line().to_string();
+            true
+        }
+    }
+
+    pub fn paste(&mut self, clipboard: &str) -> bool {
+        if clipboard.is_empty() {
+            return false;
+        }
+        self.record_undo();
+        self.delete_selection_raw();
+        let normalized = clipboard.replace("\r\n", "\n").replace('\r', "\n");
+        self.insert_text_raw(&normalized);
+        self.after_edit();
+        true
+    }
+
+    pub fn insert_char(&mut self, ch: char) {
+        self.record_undo();
+        self.delete_selection_raw();
+        let line = self.cursor_line;
+        let byte = char_to_byte(&self.lines[line], self.cursor_col);
+        self.lines[line].insert(byte, ch);
+        self.cursor_col += 1;
+        self.after_edit();
+    }
+
+    pub fn insert_tab(&mut self) {
+        self.record_undo();
+        self.delete_selection_raw();
+        let spaces = self.tab_width - (self.cursor_col % self.tab_width);
+        let text = " ".repeat(spaces);
+        self.insert_text_raw(&text);
+        self.after_edit();
+    }
+
+    pub fn insert_newline(&mut self) {
+        self.record_undo();
+        self.delete_selection_raw();
+        let line = self.cursor_line;
+        let chars: Vec<char> = self.lines[line].chars().collect();
+        let indent: String = chars
+            .iter()
+            .take(chars.len().min(self.cursor_col))
+            .take_while(|ch| ch.is_whitespace())
+            .collect();
+        let text = format!("\n{indent}");
+        self.insert_text_raw(&text);
+        self.after_edit();
+    }
+
+    pub fn backspace(&mut self) {
+        if self.selection().is_some() {
+            self.record_undo();
+            self.delete_selection_raw();
+            self.after_edit();
+            return;
+        }
+        if self.cursor_col > 0 {
+            self.record_undo();
+            let line = self.cursor_line;
+            let start = char_to_byte(&self.lines[line], self.cursor_col - 1);
+            let end = char_to_byte(&self.lines[line], self.cursor_col);
+            self.lines[line].replace_range(start..end, "");
+            self.cursor_col -= 1;
+            self.after_edit();
+            return;
+        }
+        if self.cursor_line > 0 {
+            self.record_undo();
+            let current = self.lines.remove(self.cursor_line);
+            let previous_line = self.cursor_line - 1;
+            let previous_len = self.lines[previous_line].chars().count();
+            self.lines[previous_line].push_str(&current);
+            self.cursor_line = previous_line;
+            self.cursor_col = previous_len;
+            self.anchor = None;
+            self.after_edit();
+        }
+    }
+
+    pub fn delete_forward(&mut self) {
+        if self.selection().is_some() {
+            self.record_undo();
+            self.delete_selection_raw();
+            self.after_edit();
+            return;
+        }
+        let line = self.cursor_line;
+        let length = self.lines[line].chars().count();
+        if self.cursor_col < length {
+            self.record_undo();
+            let start = char_to_byte(&self.lines[line], self.cursor_col);
+            let end = char_to_byte(&self.lines[line], self.cursor_col + 1);
+            self.lines[line].replace_range(start..end, "");
+            self.after_edit();
+            return;
+        }
+        if self.cursor_line + 1 < self.lines.len() {
+            self.record_undo();
+            let next = self.lines.remove(self.cursor_line + 1);
+            self.lines[line].push_str(&next);
+            self.after_edit();
+        }
+    }
+
+    pub fn move_left(&mut self, extend: bool) {
+        self.begin_move(extend);
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        } else if self.cursor_line > 0 {
+            self.cursor_line -= 1;
+            self.cursor_col = self.lines[self.cursor_line].chars().count();
+        }
+        self.dismissed_ghost = None;
+    }
+
+    pub fn move_right(&mut self, extend: bool) {
+        self.begin_move(extend);
+        let length = self.lines[self.cursor_line].chars().count();
+        if self.cursor_col < length {
+            self.cursor_col += 1;
+        } else if self.cursor_line + 1 < self.lines.len() {
+            self.cursor_line += 1;
+            self.cursor_col = 0;
+        }
+        self.dismissed_ghost = None;
+    }
+
+    pub fn move_up(&mut self, extend: bool) {
+        self.begin_move(extend);
+        if self.cursor_line > 0 {
+            self.cursor_line -= 1;
+            let length = self.lines[self.cursor_line].chars().count();
+            self.cursor_col = self.cursor_col.min(length);
+        }
+        self.dismissed_ghost = None;
+    }
+
+    pub fn move_down(&mut self, extend: bool) {
+        self.begin_move(extend);
+        if self.cursor_line + 1 < self.lines.len() {
+            self.cursor_line += 1;
+            let length = self.lines[self.cursor_line].chars().count();
+            self.cursor_col = self.cursor_col.min(length);
+        }
+        self.dismissed_ghost = None;
+    }
+
+    pub fn move_home(&mut self, extend: bool) {
+        self.begin_move(extend);
+        self.cursor_col = 0;
+        self.dismissed_ghost = None;
+    }
+
+    pub fn move_end(&mut self, extend: bool) {
+        self.begin_move(extend);
+        self.cursor_col = self.lines[self.cursor_line].chars().count();
+        self.dismissed_ghost = None;
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.undo.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.redo.push(current);
+        self.restore(snapshot);
+        self.dismissed_ghost = None;
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(snapshot) = self.redo.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.undo.push(current);
+        self.restore(snapshot);
+        self.dismissed_ghost = None;
+        true
+    }
+
+    pub fn ghost(&self) -> Option<GhostSuggestion> {
+        if self.selection().is_some() {
+            return None;
+        }
+        let (line, start, prefix) = self.word_prefix()?;
+        if let Some((dismissed_line, dismissed_col, dismissed_prefix)) = &self.dismissed_ghost {
+            if *dismissed_line == line
+                && *dismissed_col == self.cursor_col
+                && *dismissed_prefix == prefix
+            {
+                return None;
+            }
+        }
+        let completion = self.dictionary.suggestion(&prefix)?;
+        if start > self.cursor_col {
+            return None;
+        }
+        Some(GhostSuggestion {
+            completion: completion.to_string(),
+        })
+    }
+
+    pub fn dismiss_ghost(&mut self) {
+        if let Some((line, _, prefix)) = self.word_prefix() {
+            self.dismissed_ghost = Some((line, self.cursor_col, prefix));
+        }
+    }
+
+    pub fn accept_ghost(&mut self) -> bool {
+        let Some(suggestion) = self.ghost() else {
+            return false;
+        };
+        if suggestion.completion.is_empty() {
+            return false;
+        }
+        self.record_undo();
+        self.insert_text_raw(&suggestion.completion);
+        self.after_edit();
+        self.dismissed_ghost = None;
+        true
+    }
+
+    pub fn matches_in_line(&self, line_index: usize, needle: &str) -> Vec<usize> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let chars: Vec<char> = self
+            .lines
+            .get(line_index)
+            .map(|line| line.chars().collect())
+            .unwrap_or_default();
+        let needle: Vec<char> = needle.chars().collect();
+        if chars.len() < needle.len() || needle.is_empty() {
+            return Vec::new();
+        }
+        let mut result = Vec::new();
+        for start in 0..=chars.len() - needle.len() {
+            if chars[start..start + needle.len()] == needle[..] {
+                result.push(start);
+            }
+        }
+        result
+    }
+
+    fn word_prefix(&self) -> Option<(usize, usize, String)> {
+        let line = self.lines.get(self.cursor_line)?;
+        let chars: Vec<char> = line.chars().collect();
+        if self.cursor_col > chars.len() {
+            return None;
+        }
+        if let Some(next) = chars.get(self.cursor_col) {
+            if is_word_char(*next) {
+                return None;
+            }
+        }
+        let mut start = self.cursor_col;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        if start == self.cursor_col {
+            return None;
+        }
+        let prefix: String = chars[start..self.cursor_col].iter().collect();
+        Some((self.cursor_line, start, prefix))
+    }
+
+    fn begin_move(&mut self, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor());
+            }
+        } else {
+            self.anchor = None;
+        }
+    }
+
+    fn after_edit(&mut self) {
+        self.modified = true;
+        self.revision = self.revision.wrapping_add(1);
+        self.anchor = None;
+        self.dismissed_ghost = None;
+    }
+
+    fn record_undo(&mut self) {
+        let snapshot = self.snapshot();
+        self.undo.push(snapshot);
+        if self.undo.len() > 256 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            lines: self.lines.clone(),
+            cursor_line: self.cursor_line,
+            cursor_col: self.cursor_col,
+            anchor: self.anchor,
+            modified: self.modified,
+        }
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) {
+        self.lines = snapshot.lines;
+        self.cursor_line = snapshot.cursor_line.min(self.lines.len().saturating_sub(1));
+        let length = self.lines[self.cursor_line].chars().count();
+        self.cursor_col = snapshot.cursor_col.min(length);
+        self.anchor = snapshot.anchor;
+        self.modified = snapshot.modified;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn delete_selection_raw(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        if start.line == end.line {
+            let line = start.line;
+            let begin = char_to_byte(&self.lines[line], start.col);
+            let finish = char_to_byte(&self.lines[line], end.col);
+            self.lines[line].replace_range(begin..finish, "");
+        } else {
+            let first_chars: Vec<char> = self.lines[start.line].chars().collect();
+            let last_chars: Vec<char> = self.lines[end.line].chars().collect();
+            let mut joined: String = first_chars.iter().take(start.col).collect();
+            joined.push_str(&last_chars.iter().skip(end.col).collect::<String>());
+            self.lines[start.line] = joined;
+            self.lines.drain(start.line + 1..=end.line);
+        }
+        self.cursor_line = start.line;
+        self.cursor_col = start.col;
+        self.anchor = None;
+        true
+    }
+
+    fn insert_text_raw(&mut self, text: &str) {
+        let parts: Vec<&str> = text.split('\n').collect();
+        let line = self.cursor_line;
+        let chars: Vec<char> = self.lines[line].chars().collect();
+        let before: String = chars.iter().take(self.cursor_col).collect();
+        let after: String = chars.iter().skip(self.cursor_col).collect();
+        if parts.len() == 1 {
+            let updated = format!("{before}{}{after}", parts[0]);
+            self.lines[line] = updated;
+            self.cursor_col += parts[0].chars().count();
+            return;
+        }
+        self.lines[line] = format!("{before}{}", parts[0]);
+        for (offset, part) in parts[1..parts.len() - 1].iter().enumerate() {
+            self.lines.insert(line + 1 + offset, (*part).to_string());
+        }
+        let last = parts[parts.len() - 1];
+        self.lines
+            .insert(line + parts.len() - 1, format!("{last}{after}"));
+        self.cursor_line = line + parts.len() - 1;
+        self.cursor_col = last.chars().count();
+    }
+}
+
+fn char_to_byte(text: &str, column: usize) -> usize {
+    if column == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(column)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
+}

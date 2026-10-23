@@ -1,0 +1,29 @@
+{
+  "language": "TypeScript",
+  "extensions": [".ts", ".tsx", ".mts", ".cts"],
+  "prefixes": {
+    "co": "nsole.log(value);",
+    "con": "st value: string = \"\";",
+    "fu": "nction name(value: string): void {}",
+    "le": "t value: number = 0;",
+    "in": "terface Name { value: string; }",
+    "ty": "pe Name = { value: string };",
+    "im": "port { name } from './module';",
+    "ex": "port default name;",
+    "as": "ync function name(): Promise<void> {}",
+    "aw": "ait promise;",
+    "re": "turn value;",
+    "if": " (condition) {}",
+    "fo": "r (const item of items) {}",
+    "en": "um Name { Value }",
+    "cl": "ass Name implements Interface {}",
+    "pu": "blic name: string;",
+    "pr": "ivate value: number;",
+    "ro": "adonly value: string;",
+    "sa": "tisfies Type",
+    "un": "known",
+    "ne": "ver",
+    "vo": "id",
+    "st": "ring"
+  }
+}
