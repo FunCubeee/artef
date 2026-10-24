@@ -435,6 +435,37 @@ fn draw_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) 
     );
 }
 
+fn cursor_style(editor: &crate::editor::Editor, theme: Theme, base: Style) -> Style {
+    match editor.cursor_mode {
+        crate::editor::CursorMode::Block => Style::default()
+            .fg(theme.panel)
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+        crate::editor::CursorMode::Underline => base.add_modifier(Modifier::UNDERLINED),
+        crate::editor::CursorMode::Letters => Style::default()
+            .fg(theme.background)
+            .bg(theme.file)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn cursor_eol_span(editor: &crate::editor::Editor, theme: Theme) -> Span<'static> {
+    let style = match editor.cursor_mode {
+        crate::editor::CursorMode::Block | crate::editor::CursorMode::Letters => Style::default()
+            .fg(theme.panel)
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+        crate::editor::CursorMode::Underline => Style::default()
+            .fg(theme.accent)
+            .bg(theme.panel),
+    };
+    let glyph = match editor.cursor_mode {
+        crate::editor::CursorMode::Underline => "_",
+        _ => " ",
+    };
+    Span::styled(glyph.to_string(), style)
+}
+
 fn cursor_number_width(gutter_width: usize) -> usize {
     gutter_width.saturating_sub(1)
 }
@@ -688,10 +719,10 @@ fn build_editor_row(
             style = style.bg(theme.search).fg(theme.file);
         }
         if cursor_active && cursor_on_row && cursor_original == Some(cell.original) {
-            style = Style::default()
-                .fg(theme.background)
-                .bg(theme.file)
-                .add_modifier(Modifier::BOLD);
+            style = match editor.cursor_mode {
+                crate::editor::CursorMode::Underline => cursor_style(editor, theme, style),
+                _ => cursor_style(editor, theme, style),
+            };
         }
         spans.push(Span::styled(cell.text.clone(), style));
         code_used += cell.width;
@@ -716,13 +747,7 @@ fn build_editor_row(
         && x < x_scroll + code_width
         && code_used < code_width
     {
-        spans.push(Span::styled(
-            " ",
-            Style::default()
-                .fg(theme.background)
-                .bg(theme.file)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(cursor_eol_span(editor, theme));
     }
 
     Line::from(spans).style(Style::default().bg(theme.panel))
@@ -1220,6 +1245,7 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         Modal::NewFolderName { .. } => (68, 10, "новая папка"),
         Modal::ExtensionSelect { .. } => (76, 13, "язык для файла"),
         Modal::RuntimeSelect { .. } => (70, 13, "выбор рантайма"),
+        Modal::SettingsSelect { .. } => (64, 11, "настройки"),
         Modal::DeleteConfirm { .. } => (64, 8, "удалить?"),
         Modal::RenamePath { .. } => (72, 10, "переместить"),
         Modal::SaveConfirm { .. } => (64, 8, "сохранить?"),
@@ -1273,6 +1299,35 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         Modal::RenamePath {
             path, input, error, ..
         } => rename_lines(app, path, input, error.as_deref(), width),
+        Modal::SettingsSelect { selected, .. } => {
+            let options = ["block — прямоугольник", "underline — линия _", "letters — перекрас символа"];
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    " Отображение курсора",
+                    Style::default().fg(app.theme.file).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ];
+            for (index, text) in options.iter().enumerate() {
+                let position = *selected == index;
+                let marker = if position { "▸ " } else { "  " };
+                let style = if position {
+                    Style::default()
+                        .fg(app.theme.panel)
+                        .bg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(app.theme.file)
+                };
+                lines.push(Line::from(Span::styled(format!(" {marker}{text}"), style)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Enter выбрать · Esc отмена",
+                Style::default().fg(app.theme.muted),
+            )));
+            lines
+        }
         Modal::DeleteConfirm { path, is_dir } => {
             let raw = app.tree.relative_display(path);
             let name = fit_tail(&raw, width.saturating_sub(14));

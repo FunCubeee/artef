@@ -1,5 +1,9 @@
 workdir = ""
 
+[editor]
+# block | underline | letters
+cursor = ""
+
 [theme]
 # пустая строка, "reset" или "default" = цвет терминала; либо #rrggbb
 background = ""

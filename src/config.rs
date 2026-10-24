@@ -9,9 +9,16 @@ use crate::logging;
 use crate::platform;
 use crate::theme::{Theme, ThemeFile};
 
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct EditorConfig {
+    pub cursor: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub theme: Theme,
+    pub cursor_mode: crate::editor::CursorMode,
     pub bindings: Bindings,
     pub run: BTreeMap<String, String>,
     pub workdir: Option<PathBuf>,
@@ -21,6 +28,7 @@ pub struct LoadedConfig {
 #[serde(default)]
 pub struct Config {
     pub workdir: String,
+    pub editor: EditorConfig,
     pub theme: ThemeConfig,
     pub shortcuts: ShortcutConfig,
     pub run: BTreeMap<String, String>,
@@ -128,6 +136,7 @@ pub struct ShortcutConfig {
     pub new_folder_alt: String,
     pub delete: String,
     pub rename: String,
+    pub settings: String,
     pub focus_tree: String,
     pub focus_output: String,
     pub workdir: String,
@@ -155,6 +164,7 @@ impl Default for ShortcutConfig {
             new_folder_alt: "alt+n".to_string(),
             delete: "d, delete".to_string(),
             rename: "r, f2".to_string(),
+            settings: "alt+s".to_string(),
             focus_tree: "ctrl+b".to_string(),
             focus_output: "ctrl+o".to_string(),
             workdir: "ctrl+w".to_string(),
@@ -181,6 +191,7 @@ pub enum Action {
     NewFolder,
     Delete,
     Rename,
+    Settings,
     FocusTree,
     FocusOutput,
     Workdir,
@@ -315,6 +326,10 @@ impl Bindings {
             (
                 Action::Rename,
                 parse_bindings(&config.rename, &defaults.rename, "rename"),
+            ),
+            (
+                Action::Settings,
+                parse_bindings(&config.settings, &defaults.settings, "settings"),
             ),
             (
                 Action::FocusTree,
@@ -482,8 +497,10 @@ pub fn load() -> LoadedConfig {
     let theme = Theme::from_file(&theme_file);
     let bindings = Bindings::from_config(&config.shortcuts);
     let workdir = resolve_workdir(&config.workdir);
+    let cursor_mode = crate::editor::CursorMode::from_str_or_block(&config.editor.cursor);
     LoadedConfig {
         theme,
+        cursor_mode,
         bindings,
         run: config.run,
         workdir,
@@ -521,6 +538,7 @@ impl LoadedConfig {
     pub fn test_stub() -> Self {
         Self {
             theme: Theme::fallback(),
+            cursor_mode: crate::editor::CursorMode::Block,
             bindings: Bindings::from_config(&ShortcutConfig::default()),
             run: BTreeMap::new(),
             workdir: None,

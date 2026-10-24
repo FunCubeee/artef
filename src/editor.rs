@@ -24,6 +24,32 @@ pub struct GhostSuggestion {
     pub completion: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMode {
+    Block,
+    Underline,
+    Letters,
+}
+
+impl CursorMode {
+    pub fn from_str_or_block(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "block" => Self::Block,
+            "underline" => Self::Underline,
+            "letters" => Self::Letters,
+            _ => Self::Block,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Underline => "underline",
+            Self::Letters => "letters",
+        }
+    }
+}
+
 pub struct Editor {
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
@@ -33,6 +59,7 @@ pub struct Editor {
     pub scroll: usize,
     pub x_scroll: usize,
     pub wrap: bool,
+    pub cursor_mode: CursorMode,
     pub modified: bool,
     pub revision: u64,
     pub language: Language,
@@ -56,6 +83,7 @@ impl Default for Editor {
             scroll: 0,
             x_scroll: 0,
             wrap: false,
+            cursor_mode: CursorMode::Block,
             modified: false,
             revision: 1,
             language: Language::Plain,
@@ -83,7 +111,7 @@ impl Editor {
         let lines: Vec<String> = content.split('\n').map(|line| line.to_string()).collect();
         let language = Language::from_path(path);
         let dictionary = Dictionary::load(language);
-        Ok(Self {
+        let editor = Self {
             path: Some(path.to_path_buf()),
             lines: if lines.is_empty() {
                 vec![String::new()]
@@ -96,6 +124,7 @@ impl Editor {
             scroll: 0,
             x_scroll: 0,
             wrap: false,
+            cursor_mode: CursorMode::Block,
             modified: false,
             revision: 1,
             language,
@@ -106,7 +135,8 @@ impl Editor {
             redo: Vec::new(),
             dismissed_ghost: None,
             visual_cache: None,
-        })
+        };
+        Ok(editor)
     }
 
     pub fn has_file(&self) -> bool {

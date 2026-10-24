@@ -58,6 +58,10 @@ pub enum Modal {
         selected: usize,
         error: Option<String>,
     },
+    SettingsSelect {
+        selected: usize,
+        error: Option<String>,
+    },
     DeleteConfirm {
         path: PathBuf,
         is_dir: bool,
@@ -84,6 +88,7 @@ pub struct Notice {
 
 pub struct App {
     pub focus: Focus,
+    pub cursor_mode: crate::editor::CursorMode,
     pub tree: FileTree,
     pub workdir: PathBuf,
     pub editor: Editor,
@@ -105,11 +110,13 @@ impl App {
     pub fn new(settings: LoadedConfig, root: PathBuf, initial_file: Option<PathBuf>) -> Self {
         let mut file_tree = FileTree::new(root);
         let mut editor = Editor::default();
+        editor.cursor_mode = settings.cursor_mode;
         let mut notice = None;
         if let Some(file) = initial_file.as_ref() {
             match Editor::open(file, 4) {
                 Ok(opened) => {
                     editor = opened;
+                    editor.cursor_mode = settings.cursor_mode;
                     file_tree.reveal_file(file);
                 }
                 Err(error) => {
@@ -133,6 +140,7 @@ impl App {
             .unwrap_or_else(|| file_tree.root.clone());
         Self {
             focus,
+            cursor_mode: settings.cursor_mode,
             tree: file_tree,
             workdir,
             editor,
@@ -308,6 +316,10 @@ impl App {
         }
         if self.bindings.matches(Action::Workdir, &key) {
             self.make_workdir();
+            return;
+        }
+        if self.bindings.matches(Action::Settings, &key) {
+            self.begin_settings();
             return;
         }
         if self.bindings.matches(Action::Refresh, &key) {
@@ -691,6 +703,9 @@ impl App {
         }
         match Editor::open(path, 4) {
             Ok(editor) => {
+                let cursor_mode = self.cursor_mode;
+                let mut editor = editor;
+                editor.cursor_mode = cursor_mode;
                 self.editor = editor;
                 self.highlighter = Highlighter::default();
                 self.tree.reveal_file(path);
@@ -834,6 +849,30 @@ impl App {
         };
     }
 
+    fn begin_settings(&mut self) {
+        self.modal = Modal::SettingsSelect {
+            selected: match self.editor.cursor_mode {
+                crate::editor::CursorMode::Block => 0,
+                crate::editor::CursorMode::Underline => 1,
+                crate::editor::CursorMode::Letters => 2,
+            },
+            error: None,
+        };
+    }
+
+    fn apply_cursor_mode(&mut self, index: usize) {
+        let mode = match index {
+            0 => crate::editor::CursorMode::Block,
+            1 => crate::editor::CursorMode::Underline,
+            _ => crate::editor::CursorMode::Letters,
+        };
+        self.cursor_mode = mode;
+        self.editor.cursor_mode = mode;
+        persist_cursor_setting(mode);
+        self.modal = Modal::None;
+        self.set_notice(format!("Курсор: {}", mode.label()), false);
+    }
+
     fn begin_rename_selected(&mut self) {
         let Some(entry) = self.tree.selected_entry() else {
             return;
@@ -882,6 +921,7 @@ impl App {
                     .is_some_and(|current| current == path || current.starts_with(path));
                 if editor_inside {
                     self.editor = Editor::default();
+                    self.editor.cursor_mode = self.cursor_mode;
                 }
                 self.tree.refresh();
                 self.set_notice(format!("Удалено: {name}"), false);
@@ -1075,6 +1115,25 @@ impl App {
                     error,
                 };
             }
+            Modal::SettingsSelect {
+                mut selected,
+                error,
+            } => {
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Right => selected = (selected + 1).min(2),
+                    KeyCode::Enter => {
+                        self.apply_cursor_mode(selected);
+                        return;
+                    }
+                    _ => {}
+                }
+                self.modal = Modal::SettingsSelect {
+                    selected,
+                    error,
+                };
+            }
             Modal::DeleteConfirm { path, is_dir } => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.perform_delete(&path, is_dir);
@@ -1222,9 +1281,12 @@ impl App {
             return;
         }
         self.editor = Editor::default();
+        self.editor.cursor_mode = self.cursor_mode;
         match Editor::open(&path, 4) {
             Ok(opened) => {
                 let language = opened.language.title();
+                let mut opened = opened;
+                opened.cursor_mode = self.cursor_mode;
                 self.editor = opened;
                 self.highlighter = Highlighter::default();
                 self.tree.refresh_reveal(&path);
@@ -1274,6 +1336,57 @@ const RUNTIME_HINTS: [(&str, Option<&str>); 8] = [
     ("cpp", Some("g++")),
     ("rs", Some("cargo")),
 ];
+
+fn persist_cursor_setting(mode: crate::editor::CursorMode) {
+    let path = platform::config_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    let updated = upsert_cursor_setting(&text, mode.label());
+    let _ = fs::write(&path, updated);
+}
+
+fn upsert_cursor_setting(text: &str, value: &str) -> String {
+    let line = format!("cursor = \"{value}\"");
+    let mut result: Vec<String> = Vec::new();
+    let mut in_editor = false;
+    let mut replaced = false;
+    for row in text.lines() {
+        if row.trim_start() == "[editor]" {
+            in_editor = true;
+            result.push(row.to_string());
+            continue;
+        }
+        if row.trim_start().starts_with('[') {
+            if in_editor && !replaced {
+                result.push(line.clone());
+                replaced = true;
+            }
+            in_editor = false;
+        }
+        if in_editor && row.trim_start().starts_with("cursor") {
+            result.push(line.clone());
+            replaced = true;
+            continue;
+        }
+        result.push(row.to_string());
+    }
+    if !replaced {
+        if in_editor {
+            result.push(line.clone());
+        } else {
+            while result.last().is_some_and(|last| last.trim().is_empty()) {
+                result.pop();
+            }
+            result.push(String::new());
+            result.push("[editor]".to_string());
+            result.push(line.clone());
+        }
+    }
+    let mut out = result.join("\n");
+    out.push('\n');
+    out
+}
 
 pub fn validate_rename_path(input: &str) -> Result<(), String> {
     let trimmed = input.trim();
@@ -1454,9 +1567,9 @@ mod tests {
         app.modal = Modal::None;
         app.begin_rename_selected();
         let target = root.join("sub").join("b.txt");
-        if let Modal::RenamePath { mut input, path, is_dir, .. } = app.modal {
-            input = "sub/b.txt".to_string();
-            app.modal = Modal::RenamePath { path, is_dir, input, error: None };
+        if let Modal::RenamePath { path, is_dir, input, error, .. } = app.modal {
+            let input = "sub/b.txt".to_string();
+            app.modal = Modal::RenamePath { path, is_dir, input, error };
         }
         app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.modal, Modal::None);
@@ -1479,9 +1592,9 @@ mod tests {
             .expect("dir in tree");
         app.tree.selected = index;
         app.begin_rename_selected();
-        if let Modal::RenamePath { mut input, path, is_dir, .. } = app.modal {
-            input = "renamed".to_string();
-            app.modal = Modal::RenamePath { path, is_dir, input, error: None };
+        if let Modal::RenamePath { path, is_dir, input, error, .. } = app.modal {
+            let input = "renamed".to_string();
+            app.modal = Modal::RenamePath { path, is_dir, input, error };
         }
         app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.modal, Modal::None);
@@ -1512,6 +1625,33 @@ mod tests {
         }
         app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.modal, Modal::RenamePath { .. }));
+    }
+
+    #[test]
+    fn settings_modal_changes_cursor_mode() {
+        let mut app = App::new(LoadedConfig::test_stub(), std::env::temp_dir(), None);
+        app.begin_settings();
+        assert!(matches!(app.modal, Modal::SettingsSelect { .. }));
+        app.handle_modal_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.modal, Modal::None);
+        assert_eq!(
+            app.cursor_mode,
+            crate::editor::CursorMode::Underline
+        );
+        assert_eq!(app.editor.cursor_mode, app.cursor_mode);
+    }
+
+    #[test]
+    fn cursor_upsert_config() {
+        let text = "workdir = \"\n\n[theme]\nbackground = \"\"\n\n[shortcuts]\nsave = \"ctrl+s\"\n";
+        let updated = upsert_cursor_setting(text, "underline");
+        assert!(updated.contains("[editor]\n"));
+        assert!(updated.contains("cursor = \"underline\""));
+        assert!(updated.contains("[shortcuts]"));
+        let upper = upsert_cursor_setting("workdir = \"\n[editor]\ncursor = \"block\"\n", "letters");
+        assert!(upper.matches("cursor").count() == 1);
+        assert!(upper.contains("cursor = \"letters\""));
     }
 
     #[test]
