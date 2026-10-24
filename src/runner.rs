@@ -168,11 +168,7 @@ impl StreamBuffer {
                     if (0x40..=0x7e).contains(&byte) {
                         if byte == b'm' {
                             self.apply_sgr();
-                        } else if byte == b'H'
-                            || byte == b'f'
-                            || byte == b'J'
-                            || byte == b'K'
-                        {
+                        } else if byte == b'H' || byte == b'f' || byte == b'J' || byte == b'K' {
                             self.current.clear();
                             self.visual_col = 0;
                         }
@@ -659,7 +655,10 @@ impl Runner {
                 libc::close(master_fd);
                 libc::close(slave_fd);
             }
-            return Err(format!("fork не удался: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "fork не удался: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         if fork_result == 0 {
             unsafe {
@@ -777,7 +776,8 @@ impl Runner {
                         Some(code) => code.to_string(),
                         None => "сигнал".to_string(),
                     };
-                    self.output.add_system(format!("[artef] процесс завершился, код {code}"));
+                    self.output
+                        .add_system(format!("[artef] процесс завершился, код {code}"));
                 }
             }
         }
@@ -859,7 +859,8 @@ impl Runner {
                 code: None,
                 success: false,
             });
-            self.output.add_system("[artef] процесс остановлен (прерван)");
+            self.output
+                .add_system("[artef] процесс остановлен (прерван)");
         }
     }
 }
@@ -867,13 +868,7 @@ impl Runner {
 fn read_pty(fd: i32, sender: mpsc::Sender<RunEvent>) {
     let mut buffer = [0u8; 8192];
     loop {
-        let count = unsafe {
-            libc::read(
-                fd,
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-            )
-        };
+        let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
         if count <= 0 {
             break;
         }
@@ -900,7 +895,13 @@ fn open_pty(winsize: (u16, u16)) -> Result<(i32, i32), String> {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        if libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws) < 0
+        if libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        ) < 0
         {
             return Err(format!(
                 "openpty не удался: {}",

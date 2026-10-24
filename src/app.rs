@@ -11,9 +11,9 @@ use crate::editor::Editor;
 use crate::file_tree::FileTree;
 use crate::highlight::Highlighter;
 use crate::logging;
+use crate::platform;
 use crate::runner::{self, RunExit, RunPlan, Runner};
 use crate::theme::Theme;
-use crate::platform;
 
 pub const EXTENSIONS: [&str; 13] = [
     "py", "js", "ts", "rs", "go", "c", "cpp", "sh", "json", "yaml", "md", "toml", "txt",
@@ -61,6 +61,12 @@ pub enum Modal {
     DeleteConfirm {
         path: PathBuf,
         is_dir: bool,
+    },
+    RenamePath {
+        path: PathBuf,
+        is_dir: bool,
+        input: String,
+        error: Option<String>,
     },
     SaveConfirm {
         then_quit: bool,
@@ -296,6 +302,10 @@ impl App {
             self.begin_delete_selected();
             return;
         }
+        if self.focus == Focus::Tree && self.bindings.matches(Action::Rename, &key) {
+            self.begin_rename_selected();
+            return;
+        }
         if self.bindings.matches(Action::Workdir, &key) {
             self.make_workdir();
             return;
@@ -429,14 +439,15 @@ impl App {
         }
         if self.bindings.matches(Action::WrapToggle, &key) {
             self.editor.toggle_wrap();
-            let state = if self.editor.wrap { "вкл" } else { "выкл" };
+            let state = if self.editor.wrap {
+                "вкл"
+            } else {
+                "выкл"
+            };
             self.set_notice(format!("Перенос строк: {state}"), false);
             return;
         }
-        if key.code == KeyCode::Tab
-            && key.modifiers.is_empty()
-            && self.runner.is_running()
-        {
+        if key.code == KeyCode::Tab && key.modifiers.is_empty() && self.runner.is_running() {
             self.toggle_output_focus();
             return;
         }
@@ -712,7 +723,10 @@ impl App {
         let workdir = self.tree.current_directory();
         self.workdir = workdir.clone();
         self.set_notice(
-            format!("Рабочая директория: {}", self.tree.relative_display(&workdir)),
+            format!(
+                "Рабочая директория: {}",
+                self.tree.relative_display(&workdir)
+            ),
             false,
         );
     }
@@ -820,6 +834,23 @@ impl App {
         };
     }
 
+    fn begin_rename_selected(&mut self) {
+        let Some(entry) = self.tree.selected_entry() else {
+            return;
+        };
+        if entry.is_dir && entry.path == self.workdir {
+            self.set_notice("Нельзя переименовать рабочую директорию", true);
+            return;
+        }
+        let input = self.tree.relative_display(&entry.path);
+        self.modal = Modal::RenamePath {
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+            input,
+            error: None,
+        };
+    }
+
     fn begin_delete_selected(&mut self) {
         let Some(entry) = self.tree.selected_entry() else {
             return;
@@ -877,9 +908,10 @@ impl App {
                     KeyCode::Enter => match validate_new_name(&input) {
                         Ok(()) => {
                             let trimmed = input.trim().to_string();
-                            let has_extension = trimmed
-                                .rsplit_once('.')
-                                .is_some_and(|(base, extension)| !base.is_empty() && !extension.is_empty());
+                            let has_extension =
+                                trimmed.rsplit_once('.').is_some_and(|(base, extension)| {
+                                    !base.is_empty() && !extension.is_empty()
+                                });
                             if has_extension {
                                 self.create_file(&folder, &trimmed);
                                 return;
@@ -1047,12 +1079,85 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.perform_delete(&path, is_dir);
                 }
-                KeyCode::Char('n')
-                | KeyCode::Char('N')
-                | KeyCode::Char('q')
-                | KeyCode::Esc => {}
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {}
                 _ => {}
             },
+            Modal::RenamePath {
+                path,
+                is_dir,
+                mut input,
+                mut error,
+            } => {
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Enter => match validate_rename_path(&input) {
+                        Ok(()) => {
+                            let target = self.workdir.join(input.trim());
+                            if target == path {
+                                self.set_notice("Путь не изменился", false);
+                                return;
+                            }
+                            if is_dir && target.starts_with(&path) {
+                                error = Some("Нельзя перенести папку внутрь её самой".to_string());
+                                self.modal = Modal::RenamePath {
+                                    path,
+                                    is_dir,
+                                    input,
+                                    error,
+                                };
+                                return;
+                            }
+                            if target.exists() {
+                                error = Some(format!(
+                                    "уже существует: {}",
+                                    self.tree.relative_display(&target)
+                                ));
+                                self.modal = Modal::RenamePath {
+                                    path,
+                                    is_dir,
+                                    input,
+                                    error,
+                                };
+                                return;
+                            }
+                            let display = self.tree.relative_display(&target);
+                            match fs::rename(&path, &target) {
+                                Ok(()) => {
+                                    self.tree.refresh_reveal(&target);
+                                    if let Some(current) = self.editor.path.as_mut() {
+                                        if *current == path {
+                                            *current = target.clone();
+                                        } else if is_dir && current.starts_with(&path) {
+                                            if let Ok(rest) = current.strip_prefix(&path) {
+                                                *current = target.join(rest);
+                                            }
+                                        }
+                                    }
+                                    self.set_notice(format!("Перемещено: {display}"), false);
+                                    return;
+                                }
+                                Err(err) => {
+                                    error = Some(format!("Не удалось переместить: {err}"));
+                                }
+                            }
+                        }
+                        Err(message) => error = Some(message),
+                    },
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input.push(ch)
+                    }
+                    _ => {}
+                }
+                self.modal = Modal::RenamePath {
+                    path,
+                    is_dir,
+                    input,
+                    error,
+                };
+            }
             Modal::SaveConfirm {
                 then_quit,
                 pending_focus_tree,
@@ -1096,11 +1201,7 @@ impl App {
 
     fn create_file(&mut self, folder: &Path, file_name: &str) {
         let path = folder.join(file_name);
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(error) => {
                 let message = format!("Не удалось создать {file_name}: {error}");
@@ -1114,10 +1215,7 @@ impl App {
             }
         };
         if let Err(error) = file.flush() {
-            self.set_notice(
-                format!("Не удалось записать {file_name}: {error}"),
-                true,
-            );
+            self.set_notice(format!("Не удалось записать {file_name}: {error}"), true);
         }
         drop(file);
         if !self.save_if_needed() {
@@ -1132,10 +1230,7 @@ impl App {
                 self.tree.refresh_reveal(&path);
                 self.modal = Modal::None;
                 self.focus = Focus::Editor;
-                self.set_notice(
-                    format!("Создан {file_name}; язык: {language}"),
-                    false,
-                );
+                self.set_notice(format!("Создан {file_name}; язык: {language}"), false);
             }
             Err(error) => {
                 logging::error(&error);
@@ -1179,6 +1274,26 @@ const RUNTIME_HINTS: [(&str, Option<&str>); 8] = [
     ("cpp", Some("g++")),
     ("rs", Some("cargo")),
 ];
+
+pub fn validate_rename_path(input: &str) -> Result<(), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Имя не может быть пустым".to_string());
+    }
+    if trimmed.contains('\\') {
+        return Err("Только '/' между папками".to_string());
+    }
+    let invalid = trimmed
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..");
+    if invalid {
+        return Err("Недопустимый путь".to_string());
+    }
+    if trimmed.chars().any(|ch| ch == '\0') {
+        return Err("Символ NUL недопустим".to_string());
+    }
+    Ok(())
+}
 
 pub fn validate_new_name(input: &str) -> Result<(), String> {
     let trimmed = input.trim();
@@ -1256,7 +1371,13 @@ mod tests {
             .tree
             .entries
             .iter()
-            .filter_map(|e| if e.is_dir && e.path != root { Some(0) } else { None })
+            .filter_map(|e| {
+                if e.is_dir && e.path != root {
+                    Some(0)
+                } else {
+                    None
+                }
+            })
             .next()
             .map(|_| {
                 app.tree
@@ -1268,7 +1389,10 @@ mod tests {
             .unwrap();
         app.tree.selected = index;
         app.begin_delete_selected();
-        assert!(matches!(app.modal, Modal::DeleteConfirm { is_dir: true, .. }));
+        assert!(matches!(
+            app.modal,
+            Modal::DeleteConfirm { is_dir: true, .. }
+        ));
         app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.modal, Modal::None);
         assert!(!sub.exists());
@@ -1307,6 +1431,87 @@ mod tests {
         }
         app.begin_delete_selected();
         assert_eq!(app.modal, Modal::None);
+    }
+
+    #[test]
+    fn rename_file_flow() {
+        let root = temp_root("ren");
+        let file = root.join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        let index = app
+            .tree
+            .entries
+            .iter()
+            .position(|e| e.path == file)
+            .expect("file in tree");
+        app.tree.selected = index;
+        app.begin_rename_selected();
+        assert!(matches!(app.modal, Modal::RenamePath { .. }));
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // same path -> just notice
+        app.modal = Modal::None;
+        app.begin_rename_selected();
+        let target = root.join("sub").join("b.txt");
+        if let Modal::RenamePath { mut input, path, is_dir, .. } = app.modal {
+            input = "sub/b.txt".to_string();
+            app.modal = Modal::RenamePath { path, is_dir, input, error: None };
+        }
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.modal, Modal::None);
+        assert!(!file.exists());
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn rename_move_dir_updates_editor_path() {
+        let root = temp_root("renmov");
+        fs::create_dir_all(root.join("one").join("two")).unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        app.editor.path = Some(root.join("one").join("rep.txt"));
+        let _ = fs::write(root.join("one").join("rep.txt"), b"r");
+        let index = app
+            .tree
+            .entries
+            .iter()
+            .position(|e| e.is_dir && e.path == root.join("one"))
+            .expect("dir in tree");
+        app.tree.selected = index;
+        app.begin_rename_selected();
+        if let Modal::RenamePath { mut input, path, is_dir, .. } = app.modal {
+            input = "renamed".to_string();
+            app.modal = Modal::RenamePath { path, is_dir, input, error: None };
+        }
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.modal, Modal::None);
+        assert!(!root.join("one").exists());
+        assert!(root.join("renamed").exists());
+        assert_eq!(
+            app.editor.path,
+            Some(root.join("renamed").join("rep.txt"))
+        );
+    }
+
+    #[test]
+    fn rename_inside_itself_rejected() {
+        let root = temp_root("renself");
+        fs::create_dir_all(root.join("dir").join("deep")).unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), root.clone(), None);
+        let index = app
+            .tree
+            .entries
+            .iter()
+            .position(|e| e.is_dir && e.path == root.join("dir"))
+            .expect("dir in tree");
+        app.tree.selected = index;
+        app.begin_rename_selected();
+        if let Modal::RenamePath { mut input, path, is_dir, error, .. } = app.modal {
+            input = "dir/deep".to_string();
+            app.modal = Modal::RenamePath { path, is_dir, input, error };
+        }
+        app.handle_modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::RenamePath { .. }));
     }
 
     #[test]

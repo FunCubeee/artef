@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, EXTENSIONS, Focus, InputMode, Modal};
+use crate::app::{App, Focus, InputMode, Modal, EXTENSIONS};
 use crate::config::Action;
 use crate::editor::wrap_ranges;
 use crate::highlight::SyntaxKind;
@@ -115,7 +115,12 @@ fn draw_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn panel_block(theme: Theme, title: Line<'static>, active: bool, focused_output: bool) -> Block<'static> {
+fn panel_block(
+    theme: Theme,
+    title: Line<'static>,
+    active: bool,
+    focused_output: bool,
+) -> Block<'static> {
     let border = if focused_output || active {
         theme.accent
     } else {
@@ -318,7 +323,11 @@ fn draw_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) 
                 Style::default().fg(theme.key),
             ),
             Span::styled(
-                format!("[{wrap_mode}] · L{}:{} ", app.editor.cursor_row_number(), app.editor.column_number()),
+                format!(
+                    "[{wrap_mode}] · L{}:{} ",
+                    app.editor.cursor_row_number(),
+                    app.editor.column_number()
+                ),
                 Style::default().fg(theme.line_number),
             ),
         ])
@@ -392,7 +401,11 @@ fn draw_editor(frame: &mut Frame<'_>, app: &mut App, area: Rect, unicode: bool) 
         if visual >= total_rows {
             if gutter_width > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("{:>digits$} ~", "", digits = cursor_number_width(gutter_width)),
+                    format!(
+                        "{:>digits$} ~",
+                        "",
+                        digits = cursor_number_width(gutter_width)
+                    ),
                     Style::default().fg(theme.muted).bg(theme.panel),
                 )));
             } else {
@@ -466,7 +479,7 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, inner: Rect) {
             Style::default().fg(theme.file),
         )),
         Line::from(Span::styled(
-            "Ctrl+N файл · Alt+N папка · D удалить · Ctrl+W рабочая папка",
+            "Ctrl+N файл · Alt+N папка · D удалить · R переместить · Ctrl+W рабочая",
             Style::default().fg(theme.muted),
         )),
         Line::from(Span::styled(
@@ -511,7 +524,11 @@ fn build_editor_row(
         .map(String::as_str)
         .unwrap_or("");
     let tab_width = editor.tab_width.max(1);
-    let ranges = wrap_ranges(text, if wrapped { code_width } else { usize::MAX }, tab_width);
+    let ranges = wrap_ranges(
+        text,
+        if wrapped { code_width } else { usize::MAX },
+        tab_width,
+    );
     let Some(&(row_start, row_end)) = ranges.get(row_in_line) else {
         return Line::from(Span::styled(
             " ".repeat(code_width + gutter_width),
@@ -617,8 +634,8 @@ fn build_editor_row(
     } else {
         None
     };
-    let cursor_on_row = !wrapped
-        || (editor.cursor_col >= row_start && editor.cursor_col <= row_end);
+    let cursor_on_row =
+        !wrapped || (editor.cursor_col >= row_start && editor.cursor_col <= row_end);
     let cursor_original = if !cursor_on_row {
         None
     } else if ghost.is_some() && cursor_col > 0 {
@@ -670,10 +687,7 @@ fn build_editor_row(
         if search_flags.get(cell.original).copied().unwrap_or(false) {
             style = style.bg(theme.search).fg(theme.file);
         }
-        if cursor_active
-            && cursor_on_row
-            && cursor_original == Some(cell.original)
-        {
+        if cursor_active && cursor_on_row && cursor_original == Some(cell.original) {
             style = Style::default()
                 .fg(theme.background)
                 .bg(theme.file)
@@ -1207,6 +1221,7 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         Modal::ExtensionSelect { .. } => (76, 13, "язык для файла"),
         Modal::RuntimeSelect { .. } => (70, 13, "выбор рантайма"),
         Modal::DeleteConfirm { .. } => (64, 8, "удалить?"),
+        Modal::RenamePath { .. } => (72, 10, "переместить"),
         Modal::SaveConfirm { .. } => (64, 8, "сохранить?"),
         Modal::QuitConfirm => (64, 8, "выход из artef"),
         Modal::None => return,
@@ -1240,9 +1255,7 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
             folder,
             input,
             error,
-        } => {
-            new_name_lines(app, "Файл", folder, input, error.as_deref(), width)
-        }
+        } => new_name_lines(app, "Файл", folder, input, error.as_deref(), width),
         Modal::NewFolderName {
             parent,
             input,
@@ -1257,6 +1270,9 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         Modal::RuntimeSelect {
             selected, error, ..
         } => runtime_lines(app, *selected, error.as_deref(), width),
+        Modal::RenamePath {
+            path, input, error, ..
+        } => rename_lines(app, path, input, error.as_deref(), width),
         Modal::DeleteConfirm { path, is_dir } => {
             let raw = app.tree.relative_display(path);
             let name = fit_tail(&raw, width.saturating_sub(14));
@@ -1357,6 +1373,55 @@ fn new_name_lines(
     )));
     lines.push(Line::from(Span::styled(
         " Enter далее · Esc отмена",
+        Style::default().fg(theme.muted),
+    )));
+    lines
+}
+
+fn rename_lines(
+    app: &App,
+    path: &std::path::Path,
+    input: &str,
+    error: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let theme = app.theme;
+    let cursor = if use_unicode(width as u16) {
+        "▌"
+    } else {
+        "_"
+    };
+    let source = fit_tail(&app.tree.relative_display(path), width.saturating_sub(12));
+    let input_text = if input.is_empty() {
+        cursor.to_string()
+    } else {
+        format!("{input}{cursor}")
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Изменить путь от рабочей папки",
+            Style::default().fg(theme.file).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(" Откуда: ", Style::default().fg(theme.key)),
+            Span::styled(source, Style::default().fg(theme.muted)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Новый путь: ", Style::default().fg(theme.key)),
+            Span::styled(input_text, Style::default().fg(theme.file)),
+        ]),
+    ];
+    if let Some(error) = error {
+        lines.push(Line::from(Span::styled(
+            format!(" {error}"),
+            Style::default().fg(theme.error),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        " Перенос в подпапку: sub/имя.txt · Enter переместить · Esc отмена",
         Style::default().fg(theme.muted),
     )));
     lines
@@ -1527,9 +1592,7 @@ fn confirm_lines(app: &App, question: &str, hints: &str, width: usize) -> Vec<Li
         Line::from(""),
         Line::from(Span::styled(
             chunk_text_line(question, width),
-            Style::default()
-                .fg(theme.file)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.file).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(

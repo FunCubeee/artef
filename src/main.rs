@@ -172,12 +172,7 @@ fn install_panic_hook() {
     panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            LeaveAlternateScreen,
-            DisableBracketedPaste,
-            Show
-        );
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste, Show);
         runner::kill_registered_child();
         logging::error(&format!("паника: {info}"));
         original(info);
@@ -227,7 +222,8 @@ fn run_loop(
         if event::poll(Duration::from_millis(40))
             .map_err(|error| format!("ошибка ожидания ввода: {error}"))?
         {
-            match event::read().map_err(|error| format!("ошибка чтения ввода: {error}"))? {
+            match event::read().map_err(|error| format!("ошибка чтения ввода: {error}"))?
+            {
                 Event::Key(key) => app.handle_key(key),
                 Event::Paste(text) => app.handle_paste(&text),
                 Event::Resize(width, height) => {

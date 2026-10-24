@@ -42,7 +42,7 @@ pub struct Theme {
     pub key_color: Color,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThemeFile {
     pub background: String,
     pub panel: String,
@@ -79,48 +79,6 @@ pub struct ThemeFile {
     pub code: String,
     pub tag: String,
     pub key_color: String,
-}
-
-impl Default for ThemeFile {
-    fn default() -> Self {
-        Self {
-            background: String::new(),
-            panel: String::new(),
-            border: String::new(),
-            active_bg: String::new(),
-            accent: String::new(),
-            folder: String::new(),
-            file: String::new(),
-            python: String::new(),
-            rust: String::new(),
-            javascript: String::new(),
-            go: String::new(),
-            ghost: String::new(),
-            status_bg: String::new(),
-            status_fg: String::new(),
-            key: String::new(),
-            error: String::new(),
-            output: String::new(),
-            line_number: String::new(),
-            selection: String::new(),
-            search: String::new(),
-            muted: String::new(),
-            keyword: String::new(),
-            type_color: String::new(),
-            string: String::new(),
-            comment: String::new(),
-            number: String::new(),
-            function: String::new(),
-            macro_color: String::new(),
-            operator: String::new(),
-            property: String::new(),
-            heading: String::new(),
-            link: String::new(),
-            code: String::new(),
-            tag: String::new(),
-            key_color: String::new(),
-        }
-    }
 }
 
 impl From<&ThemeConfig> for ThemeFile {
@@ -239,6 +197,7 @@ impl Theme {
         }
     }
 
+    #[cfg(test)]
     pub fn fallback() -> Self {
         Theme::terminal()
     }

@@ -127,6 +127,7 @@ pub struct ShortcutConfig {
     pub new_folder: String,
     pub new_folder_alt: String,
     pub delete: String,
+    pub rename: String,
     pub focus_tree: String,
     pub focus_output: String,
     pub workdir: String,
@@ -153,6 +154,7 @@ impl Default for ShortcutConfig {
             new_folder: "f7".to_string(),
             new_folder_alt: "alt+n".to_string(),
             delete: "d, delete".to_string(),
+            rename: "r, f2".to_string(),
             focus_tree: "ctrl+b".to_string(),
             focus_output: "ctrl+o".to_string(),
             workdir: "ctrl+w".to_string(),
@@ -178,6 +180,7 @@ pub enum Action {
     NewFile,
     NewFolder,
     Delete,
+    Rename,
     FocusTree,
     FocusOutput,
     Workdir,
@@ -310,16 +313,16 @@ impl Bindings {
                 parse_bindings(&config.delete, &defaults.delete, "delete"),
             ),
             (
+                Action::Rename,
+                parse_bindings(&config.rename, &defaults.rename, "rename"),
+            ),
+            (
                 Action::FocusTree,
                 parse_bindings(&config.focus_tree, &defaults.focus_tree, "focus_tree"),
             ),
             (
                 Action::FocusOutput,
-                parse_bindings(
-                    &config.focus_output,
-                    &defaults.focus_output,
-                    "focus_output",
-                ),
+                parse_bindings(&config.focus_output, &defaults.focus_output, "focus_output"),
             ),
             (
                 Action::Workdir,
@@ -327,11 +330,7 @@ impl Bindings {
             ),
             (
                 Action::WrapToggle,
-                parse_bindings(
-                    &config.wrap_toggle,
-                    &defaults.wrap_toggle,
-                    "wrap_toggle",
-                ),
+                parse_bindings(&config.wrap_toggle, &defaults.wrap_toggle, "wrap_toggle"),
             ),
             (
                 Action::Refresh,
@@ -339,11 +338,7 @@ impl Bindings {
             ),
             (
                 Action::AcceptGhost,
-                parse_bindings(
-                    &config.accept_ghost,
-                    &defaults.accept_ghost,
-                    "accept_ghost",
-                ),
+                parse_bindings(&config.accept_ghost, &defaults.accept_ghost, "accept_ghost"),
             ),
         ];
         Self { entries }
@@ -579,7 +574,10 @@ mod tests {
     #[test]
     fn default_bindings_parse() {
         let bindings = Bindings::from_config(&ShortcutConfig::default());
-        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let key = KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
         assert!(bindings.matches(Action::Quit, &key));
         let f10 = KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE);
         assert!(bindings.matches(Action::Quit, &f10));

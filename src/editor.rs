@@ -704,7 +704,9 @@ pub fn wrap_ranges(text: &str, width: usize, tab_width: usize) -> Vec<(usize, us
             let w = if ch == '\t' {
                 0
             } else {
-                unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
+                unicode_width::UnicodeWidthChar::width(ch)
+                    .unwrap_or(0)
+                    .max(1)
             };
             (ch, w)
         })
@@ -790,10 +792,7 @@ mod tests {
     #[test]
     fn wrap_ranges_break_long_lines() {
         let ranges = wrap_ranges("abcdefgh", 3, 4);
-        assert_eq!(
-            ranges,
-            vec![(0, 3), (3, 6), (6, 8)]
-        );
+        assert_eq!(ranges, vec![(0, 3), (3, 6), (6, 8)]);
     }
 
     #[test]
