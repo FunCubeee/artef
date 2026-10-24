@@ -665,8 +665,12 @@ fn build_editor_row(
     } else {
         None
     };
-    let cursor_on_row =
-        !wrapped || (editor.cursor_col >= row_start && editor.cursor_col <= row_end);
+    let cursor_on_row = !wrapped
+        || if row_end == chars.len() {
+            editor.cursor_col >= row_start
+        } else {
+            editor.cursor_col >= row_start && editor.cursor_col < row_end
+        };
     let cursor_original = if !cursor_on_row {
         None
     } else if ghost.is_some() && cursor_col > 0 {
@@ -718,7 +722,11 @@ fn build_editor_row(
         if search_flags.get(cell.original).copied().unwrap_or(false) {
             style = style.bg(theme.search).fg(theme.file);
         }
-        if cursor_active && cursor_on_row && cursor_original == Some(cell.original) {
+        if cursor_active
+            && line_index == editor.cursor_line
+            && cursor_on_row
+            && cursor_original == Some(cell.original)
+        {
             style = match editor.cursor_mode {
                 crate::editor::CursorMode::Underline => cursor_style(editor, theme, style),
                 _ => cursor_style(editor, theme, style),
@@ -741,6 +749,7 @@ fn build_editor_row(
             );
         }
     } else if cursor_active
+        && line_index == editor.cursor_line
         && cursor_on_row
         && cursor_col >= chars.len()
         && x >= x_scroll
@@ -1673,4 +1682,79 @@ fn chunk_text_line(text: &str, width: usize) -> String {
         used += char_width;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::config::LoadedConfig;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn caret_cell_matches_cursor_mode() {
+        let dir = std::env::temp_dir().join(format!("artef-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.py");
+        std::fs::write(&path, "hello\n\n").unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), dir.clone(), None);
+        app.focus = crate::app::Focus::Editor;
+        app.editor = crate::editor::Editor::open(&path, app.editor.tab_width).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let theme = app.theme;
+        let caret: Vec<(u16, u16)> = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf.cell((*x, *y)).map(|c| c.bg == theme.accent).unwrap_or(false))
+            .collect();
+        assert_eq!(caret.len(), 1, "expected exactly one accent cell, got {caret:?}");
+        let (cx, cy) = caret[0];
+        assert_eq!(buf.cell((cx, cy)).unwrap().symbol(), "h");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn caret_cells(app: &mut App) -> Vec<(u16, u16)> {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let accent = app.theme.accent;
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf.cell((*x, *y)).map(|c| c.bg == accent).unwrap_or(false))
+            .collect()
+    }
+
+    fn app_with_file(content: &str) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("artef-ui-{}-{}", std::process::id(), content.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.py");
+        std::fs::write(&path, content).unwrap();
+        let mut app = App::new(LoadedConfig::test_stub(), dir.clone(), None);
+        app.focus = crate::app::Focus::Editor;
+        app.editor = crate::editor::Editor::open(&path, app.editor.tab_width).unwrap();
+        (app, dir)
+    }
+
+    #[test]
+    fn caret_only_on_cursor_line() {
+        let (mut app, dir) = app_with_file("alpha\nbeta\n\ngamma\n");
+        app.editor.cursor_line = 2;
+        app.editor.cursor_col = 0;
+        let cells = caret_cells(&mut app);
+        assert_eq!(cells.len(), 1, "empty cursor line must have a single caret: {cells:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn caret_single_visual_row_when_wrapped() {
+        let (mut app, dir) = app_with_file(&format!("{}\n", "word ".repeat(60)));
+        app.editor.wrap = true;
+        app.editor.cursor_line = 0;
+        app.editor.cursor_col = 40;
+        let cells = caret_cells(&mut app);
+        assert_eq!(cells.len(), 1, "wrapped caret must stay on one visual row: {cells:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

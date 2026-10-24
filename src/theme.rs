@@ -202,7 +202,7 @@ impl Theme {
         Theme::terminal()
     }
 
-    fn terminal() -> Self {
+    pub fn terminal() -> Self {
         Self {
             background: Color::Reset,
             panel: Color::Reset,
